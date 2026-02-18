@@ -241,6 +241,8 @@ async def sizes_clothes(
         "notes": str(j.get("notes") or ""),
     }
 
+    print(out)
+
     return ClothesOut(**out)
 
 
@@ -270,4 +272,7 @@ async def sizes_shoes(
         "confidence": float(j.get("confidence") or 0.0),
         "notes": str(j.get("notes") or ""),
     }
+
+    print(out)
+
     return ShoesOut(**out)
