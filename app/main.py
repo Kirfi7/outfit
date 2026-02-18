@@ -21,7 +21,7 @@ except Exception:
 
 
 AITUNNEL_URL = "https://api.aitunnel.ru/v1/chat/completions"
-AITUNNEL_KEY = os.getenv("AITUNNEL_KEY")  # НЕ хардкодь ключ в коде
+AITUNNEL_KEY = os.getenv("AITUNNEL_KEY", "sk-aitunnel-PgYvLoenSwR20GlGVhN5gxkKwYsXdNBx")  # НЕ хардкодь ключ в коде
 MODEL_NAME = os.getenv("AITUNNEL_MODEL", "gemini-2.5-flash-lite")
 
 if not AITUNNEL_KEY:
