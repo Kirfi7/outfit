@@ -305,17 +305,49 @@ Image 5: верхняя одежда (outer) если есть
 
 
 def _decode_aitunnel_image_resp(data: dict) -> bytes:
-    # варианты разных прокси/схем
-    b64 = None
+    # достаем первый элемент
+    item = None
     if isinstance(data, dict):
         if "data" in data and data["data"]:
-            b64 = data["data"][0].get("b64_json") or data["data"][0].get("b64")
-        if not b64 and "images" in data and data["images"]:
-            b64 = data["images"][0].get("b64_json") or data["images"][0].get("b64")
+            item = data["data"][0]
+        elif "images" in data and data["images"]:
+            item = data["images"][0]
 
-    if not b64:
+    if not isinstance(item, dict):
         raise HTTPException(502, f"unexpected images response: {str(data)[:900]}")
-    return base64.b64decode(b64)
+
+    # 1) b64_json / b64
+    b64 = item.get("b64_json") or item.get("b64")
+    if b64:
+        return base64.b64decode(b64)
+
+    # 2) url (может быть data-url)
+    url = item.get("url")
+    if url:
+        url = str(url).strip()
+
+        # data:image/png;base64,....
+        if url.startswith("data:"):
+            # берем только часть после запятой
+            try:
+                b64_part = url.split(",", 1)[1]
+                return base64.b64decode(b64_part)
+            except Exception as e:
+                raise HTTPException(502, f"bad data-url image: {e}")
+
+        # обычный URL на картинку
+        if url.startswith("http://") or url.startswith("https://"):
+            try:
+                r = requests.get(url, timeout=120)
+                if r.status_code != 200:
+                    raise HTTPException(502, f"cannot fetch image url {r.status_code}: {(r.text or '')[:300]}")
+                return r.content
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(502, f"cannot fetch image url: {e}")
+
+    raise HTTPException(502, f"unexpected images response: {str(data)[:900]}")
 
 
 def _call_aitunnel_image_multi(prompt: str, images_data_urls: list[str]) -> bytes:
