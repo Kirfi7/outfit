@@ -330,10 +330,7 @@ Image 5: верхняя одежда (outer) если есть
 
 
 def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
-    """
-    Любой вход (heic/jpg/png/webp) -> PNG bytes + resize + EXIF orientation fix.
-    Для images.edit лучше PNG.
-    """
+    """Любой вход -> PNG bytes + resize + EXIF orientation fix."""
     try:
         img = Image.open(BytesIO(image_bytes))
     except Exception as e:
@@ -358,7 +355,6 @@ def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
         new_h = max(1, int(h * scale))
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-    # PNG лучше держать в RGBA (не обязательно, но ок)
     if img.mode not in ("RGBA", "RGB"):
         img = img.convert("RGBA")
 
@@ -367,11 +363,15 @@ def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
     return out.getvalue()
 
 
-def _as_upload_tuple(png_bytes: bytes, name: str) -> Tuple[str, bytes, str]:
+def _bytes_to_named_file(png_bytes: bytes, filename: str) -> BytesIO:
     """
-    Формат для multipart в OpenAI SDK: (filename, bytes, mimetype)
+    OpenAI SDK ждёт file-like.
+    Критично: у BytesIO должно быть имя файла (атрибут .name), иначе SDK часто не прикрепляет файл как image.
     """
-    return (f"{name}.png", png_bytes, "image/png")
+    bio = BytesIO(png_bytes)
+    bio.name = filename  # <-- ключевая строчка
+    bio.seek(0)
+    return bio
 
 
 @app.post("/tryon/flux.2-klein-4b/outfit")
@@ -383,12 +383,11 @@ async def tryon_gpt_image_1_outfit(
     outer: Optional[UploadFile] = File(None),
     prompt_extra: Optional[str] = None,
 ):
-    # 1) читаем человека
+    # читаем входы
     p_bytes = await person_front.read()
     if not p_bytes:
         raise HTTPException(400, "person_front required")
 
-    # 2) читаем вещи
     top_bytes = await top.read()
     bottom_bytes = await bottom.read()
     if not top_bytes:
@@ -399,42 +398,41 @@ async def tryon_gpt_image_1_outfit(
     shoes_bytes = await shoes.read() if shoes else None
     outer_bytes = await outer.read() if outer else None
 
-    # 3) нормализация -> PNG
+    # normalize -> png bytes
     person_png = _normalize_to_png(p_bytes, max_side=1280)
     top_png = _normalize_to_png(top_bytes, max_side=1280)
     bottom_png = _normalize_to_png(bottom_bytes, max_side=1280)
 
-    files: List[Tuple[str, bytes, str]] = [
-        _as_upload_tuple(person_png, "person_front"),
-        _as_upload_tuple(top_png, "top"),
-        _as_upload_tuple(bottom_png, "bottom"),
+    images: List[BytesIO] = [
+        _bytes_to_named_file(person_png, "person_front.png"),
+        _bytes_to_named_file(top_png, "top.png"),
+        _bytes_to_named_file(bottom_png, "bottom.png"),
     ]
 
-    if shoes_bytes:
-        files.append(_as_upload_tuple(_normalize_to_png(shoes_bytes, 1280), "shoes"))
+    if shoes_bytes and len(shoes_bytes) > 0:
+        images.append(_bytes_to_named_file(_normalize_to_png(shoes_bytes, 1280), "shoes.png"))
 
-    if outer_bytes:
-        files.append(_as_upload_tuple(_normalize_to_png(outer_bytes, 1280), "outer"))
+    if outer_bytes and len(outer_bytes) > 0:
+        images.append(_bytes_to_named_file(_normalize_to_png(outer_bytes, 1280), "outer.png"))
 
-    # 4) prompt
     prompt = TRYON_OUTFIT_PROMPT
     if prompt_extra and prompt_extra.strip():
         prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
 
-    # 5) Вызов images.edit (multipart/form-data внутри SDK)
+    # вызов images.edit (multipart внутри SDK)
     try:
         result = client.images.edit(
-            model=TRYON_MODEL2,     # "gpt-image-1"
-            image=files,           # СПИСОК картинок
+            model=TRYON_MODEL2,   # "gpt-image-1"
+            image=images,        # <-- ВОТ ТУТ file-like objects, не tuple
             prompt=prompt,
             size="1024x1024",
+            output_format="png",
         )
     except Exception as e:
         raise HTTPException(502, f"tryon failed: {e}")
 
-    if not result.data or not result.data[0].b64_json:
+    if not result.data or not getattr(result.data[0], "b64_json", None):
         raise HTTPException(502, f"unexpected image response: {result}")
 
-    img_bytes = base64.b64decode(result.data[0].b64_json)
-
-    return Response(content=img_bytes, media_type="image/png")
+    out_bytes = base64.b64decode(result.data[0].b64_json)
+    return Response(content=out_bytes, media_type="image/png")
