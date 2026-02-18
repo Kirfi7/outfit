@@ -1,0 +1,11 @@
+.idea
+.ipynb_checkpoints
+.mypy_cache
+.vscode
+pycache
+.pytest_cache
+parser_products/funko
+.env
+app/zphoto
+app/prods.json
+app/prods_updated.json
