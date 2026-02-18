@@ -276,3 +276,120 @@ async def sizes_shoes(
     print(out)
 
     return ShoesOut(**out)
+
+from fastapi.responses import Response
+
+# --- TRY-ON (flux) ---
+TRYON_MODEL = os.getenv("TRYON_MODEL", "flux.2-klein-4b")
+AITUNNEL_IMAGES_URL = os.getenv("AITUNNEL_IMAGES_URL", "https://api.aitunnel.ru/v1/images/generations")
+# если у aitunnel другой endpoint, поменяешь тут
+
+TRYON_PROMPT = """
+Сгенерируй реалистичную виртуальную примерку одежды на человеке.
+
+Входные изображения:
+- Image 1: человек (вид спереди)
+- Image 2: одежда (каталожное фото)
+
+Задача:
+- Оставь человека тем же (лицо, поза, фон максимально сохранить)
+- Заменить только одежду на одежду с Image 2
+- Одежда должна выглядеть реалистично по посадке, материалу и цвету
+- Не менять телосложение, не дорисовывать лишние предметы
+- Максимально фотореалистично, high quality, no artifacts
+
+Верни только изображение.
+""".strip()
+
+
+def _call_aitunnel_image(prompt: str, img1_data_url: str, img2_data_url: str) -> bytes:
+    """
+    Ожидаемый формат images endpoint (похож на OpenAI-style):
+    {
+      "model": "...",
+      "prompt": "...",
+      "image": ["data:image/jpeg;base64,...", "data:image/jpeg;base64,..."],
+      "size": "1024x1024",
+      "response_format": "b64_json"
+    }
+    Возвращаем bytes готовой картинки (png/jpg).
+    """
+
+    headers = {
+        "Authorization": f"Bearer {AITUNNEL_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": TRYON_MODEL,
+        "prompt": prompt,
+        # у разных провайдеров поле может называться "image" или "images"
+        "image": [img1_data_url, img2_data_url],
+        "size": "1024x1024",
+        "response_format": "b64_json",
+        # можно ещё quality/steps если поддерживается
+    }
+
+    try:
+        r = requests.post(AITUNNEL_IMAGES_URL, headers=headers, json=payload, timeout=180)
+    except Exception as e:
+        raise HTTPException(502, f"aitunnel images request failed: {e}")
+
+    if r.status_code != 200:
+        body = (r.text or "")[:1500]
+        raise HTTPException(502, f"aitunnel images error {r.status_code}: {body}")
+
+    data = r.json()
+
+    # типичные варианты:
+    # 1) {"data":[{"b64_json":"..."}]}
+    # 2) {"images":[{"b64":"..."}]}
+    b64 = None
+    try:
+        if "data" in data and data["data"]:
+            b64 = data["data"][0].get("b64_json")
+        if not b64 and "images" in data and data["images"]:
+            b64 = data["images"][0].get("b64") or data["images"][0].get("b64_json")
+    except Exception:
+        b64 = None
+
+    if not b64:
+        raise HTTPException(502, f"unexpected images response: {str(data)[:800]}")
+
+    try:
+        return base64.b64decode(b64)
+    except Exception as e:
+        raise HTTPException(502, f"bad b64 image: {e}")
+
+
+@app.post("/tryon/flux")
+async def tryon_flux(
+    person_front: UploadFile = File(...),
+    garment: UploadFile = File(...),
+    prompt_extra: Optional[str] = None,
+):
+    # 1) читаем
+    p_bytes = await person_front.read()
+    g_bytes = await garment.read()
+    if not p_bytes or not g_bytes:
+        raise HTTPException(400, "person_front and garment images required")
+
+    # 2) нормализуем (важно для heic и чтобы не улетать в огромные размеры)
+    p_jpeg = _normalize_to_jpeg(p_bytes, max_side=1280, quality=82)
+    g_jpeg = _normalize_to_jpeg(g_bytes, max_side=1280, quality=82)
+
+    # 3) в data_url
+    p_url = _to_data_url_jpeg(p_jpeg)
+    g_url = _to_data_url_jpeg(g_jpeg)
+
+    # 4) prompt
+    prompt = TRYON_PROMPT
+    if prompt_extra:
+        prompt = prompt + "\n\nДоп. требования:\n" + prompt_extra.strip()
+
+    # 5) дергаем генерацию
+    img_bytes = _call_aitunnel_image(prompt, p_url, g_url)
+
+    # 6) отдаём как картинку (пусть будет png, но мы не знаем точно формат)
+    # если хочешь — можно всегда конвертить в jpeg/ png через PIL
+    return Response(content=img_bytes, media_type="image/png")
