@@ -281,25 +281,41 @@ from fastapi.responses import Response
 
 # --- TRY-ON (flux) ---
 TRYON_MODEL = os.getenv("TRYON_MODEL", "flux.2-klein-4b")
-AITUNNEL_IMAGES_URL = os.getenv("AITUNNEL_IMAGES_URL", "https://api.aitunnel.ru/v1/images/generations")
-# если у aitunnel другой endpoint, поменяешь тут
+AITUNNEL_IMAGES_URL = os.getenv(
+    "AITUNNEL_IMAGES_URL",
+    "https://api.aitunnel.ru/v1/images/generations",
+)
 
-TRYON_PROMPT = """
-Сгенерируй реалистичную виртуальную примерку одежды на человеке.
+TRYON_OUTFIT_PROMPT = """
+Сгенерируй реалистичную виртуальную примерку полного образа на человеке.
 
-Входные изображения:
-- Image 1: человек (вид спереди)
-- Image 2: одежда (каталожное фото)
+Image 1: человек (вид спереди)
+Image 2: верх (top)
+Image 3: низ (bottom)
+Image 4: обувь (shoes) если есть
+Image 5: верхняя одежда (outer) если есть
 
-Задача:
-- Оставь человека тем же (лицо, поза, фон максимально сохранить)
-- Заменить только одежду на одежду с Image 2
-- Одежда должна выглядеть реалистично по посадке, материалу и цвету
-- Не менять телосложение, не дорисовывать лишние предметы
-- Максимально фотореалистично, high quality, no artifacts
-
-Верни только изображение.
+Требования:
+- сохранить лицо, позу и фон максимально близко к исходному фото
+- одеть человека в предоставленные вещи (сохрани цвет/материал/крой)
+- реалистичная посадка и складки, корректное освещение
+- не менять телосложение, не добавлять лишние предметы
+- фотореализм, high quality
 """.strip()
+
+
+def _decode_aitunnel_image_resp(data: dict) -> bytes:
+    # варианты разных прокси/схем
+    b64 = None
+    if isinstance(data, dict):
+        if "data" in data and data["data"]:
+            b64 = data["data"][0].get("b64_json") or data["data"][0].get("b64")
+        if not b64 and "images" in data and data["images"]:
+            b64 = data["images"][0].get("b64_json") or data["images"][0].get("b64")
+
+    if not b64:
+        raise HTTPException(502, f"unexpected images response: {str(data)[:900]}")
+    return base64.b64decode(b64)
 
 
 def _call_aitunnel_image_multi(prompt: str, images_data_urls: list[str]) -> bytes:
@@ -308,28 +324,35 @@ def _call_aitunnel_image_multi(prompt: str, images_data_urls: list[str]) -> byte
         "Content-Type": "application/json",
     }
 
-    payload = {
+    # Попробуем сначала самый частый формат: images:[...]
+    payload1 = {
         "model": TRYON_MODEL,
         "prompt": prompt,
-        "image": images_data_urls,   # <— список любой длины
+        "images": images_data_urls,
         "size": "1024x1024",
         "response_format": "b64_json",
     }
 
-    r = requests.post(AITUNNEL_IMAGES_URL, headers=headers, json=payload, timeout=180)
-    if r.status_code != 200:
-        raise HTTPException(502, f"aitunnel images error {r.status_code}: {(r.text or '')[:1500]}")
+    r = requests.post(AITUNNEL_IMAGES_URL, headers=headers, json=payload1, timeout=240)
+    if r.status_code == 200:
+        return _decode_aitunnel_image_resp(r.json())
 
-    data = r.json()
-    b64 = None
-    if "data" in data and data["data"]:
-        b64 = data["data"][0].get("b64_json")
-    if not b64 and "images" in data and data["images"]:
-        b64 = data["images"][0].get("b64") or data["images"][0].get("b64_json")
+    # Фолбэк: некоторые прокси ждут image:[...]
+    payload2 = dict(payload1)
+    payload2.pop("images", None)
+    payload2["image"] = images_data_urls
 
-    if not b64:
-        raise HTTPException(502, f"unexpected images response: {str(data)[:800]}")
-    return base64.b64decode(b64)
+    r2 = requests.post(AITUNNEL_IMAGES_URL, headers=headers, json=payload2, timeout=240)
+    if r2.status_code == 200:
+        return _decode_aitunnel_image_resp(r2.json())
+
+    # Если оба не зашли — вернём детали
+    body1 = (r.text or "")[:800]
+    body2 = (r2.text or "")[:800]
+    raise HTTPException(
+        502,
+        f"aitunnel images error. payload1={r.status_code}:{body1} | payload2={r2.status_code}:{body2}",
+    )
 
 
 @app.post("/tryon/flux/outfit")
@@ -349,7 +372,6 @@ async def tryon_flux_outfit(
     p_jpeg = _normalize_to_jpeg(p_bytes, max_side=1280, quality=82)
     images = [_to_data_url_jpeg(p_jpeg)]
 
-    # helper to add garment
     async def add_image(f: Optional[UploadFile], name: str):
         if not f:
             return
@@ -364,31 +386,11 @@ async def tryon_flux_outfit(
     await add_image(shoes, "shoes")
     await add_image(outer, "outer")
 
-    # prompt
-    prompt = """
-Сгенерируй реалистичную виртуальную примерку полного образа на человеке.
-
-Image 1: человек (вид спереди)
-Image 2: верх (top)
-Image 3: низ (bottom)
-Image 4: обувь (shoes) если есть
-Image 5: верхняя одежда (outer) если есть
-
-Требования:
-- сохранить лицо, позу и фон как можно ближе к исходному фото человека
-- одеть человека в предоставленные вещи, сохранив стиль/цвет/материал
-- реалистичная посадка, складки, освещение
-- не менять телосложение и не добавлять лишние предметы
-""".strip()
-
+    prompt = TRYON_OUTFIT_PROMPT
     if prompt_extra:
         prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
 
-    # дергаем генерацию (ВАЖНО: тут мы передаем список всех картинок)
-    img_bytes = _call_aitunnel_image(prompt, images[0], images[1])  # временно
-
-    # !!! ВНИМАНИЕ !!!
-    # твоя текущая _call_aitunnel_image принимает ровно 2 картинки.
-    # ниже я покажу как сделать универсально N картинок.
+    # ВОТ ТУТ ГЛАВНОЕ: вызываем multi, а не _call_aitunnel_image
+    img_bytes = _call_aitunnel_image_multi(prompt, images)
 
     return Response(content=img_bytes, media_type="image/png")
