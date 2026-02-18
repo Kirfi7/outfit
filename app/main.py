@@ -308,7 +308,7 @@ client = OpenAI(
     base_url="https://api.aitunnel.ru/v1/",
 )
 
-TRYON_MODEL2 = os.getenv("TRYON_MODEL", "flux.2-klein-4b")
+TRYON_MODEL2 = os.getenv("TRYON_MODEL2", "flux.2-klein-4b")
 
 TRYON_OUTFIT_PROMPT = """
 Сгенерируй реалистичную виртуальную примерку полного образа на человеке.
@@ -363,15 +363,16 @@ def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
     return out.getvalue()
 
 
-def _bytes_to_named_file(png_bytes: bytes, filename: str) -> BytesIO:
-    """
-    OpenAI SDK ждёт file-like.
-    Критично: у BytesIO должно быть имя файла (атрибут .name), иначе SDK часто не прикрепляет файл как image.
-    """
-    bio = BytesIO(png_bytes)
-    bio.name = filename  # <-- ключевая строчка
-    bio.seek(0)
-    return bio
+def _write_tmp_png(png_bytes: bytes, prefix: str) -> str:
+    """Сохраняем bytes в временный .png и возвращаем путь."""
+    f = tempfile.NamedTemporaryFile(prefix=prefix + "_", suffix=".png", delete=False)
+    try:
+        f.write(png_bytes)
+        f.flush()
+        return f.name
+    finally:
+        f.close()
+
 
 
 @app.post("/tryon/flux.2-klein-4b/outfit")
@@ -383,13 +384,12 @@ async def tryon_gpt_image_1_outfit(
     outer: Optional[UploadFile] = File(None),
     prompt_extra: Optional[str] = None,
 ):
-    # читаем входы
     p_bytes = await person_front.read()
-    if not p_bytes:
-        raise HTTPException(400, "person_front required")
-
     top_bytes = await top.read()
     bottom_bytes = await bottom.read()
+
+    if not p_bytes:
+        raise HTTPException(400, "person_front required")
     if not top_bytes:
         raise HTTPException(400, "top is empty")
     if not bottom_bytes:
@@ -398,41 +398,58 @@ async def tryon_gpt_image_1_outfit(
     shoes_bytes = await shoes.read() if shoes else None
     outer_bytes = await outer.read() if outer else None
 
-    # normalize -> png bytes
-    person_png = _normalize_to_png(p_bytes, max_side=1280)
-    top_png = _normalize_to_png(top_bytes, max_side=1280)
-    bottom_png = _normalize_to_png(bottom_bytes, max_side=1280)
+    # normalize -> png
+    person_png = _normalize_to_png(p_bytes, 1280)
+    top_png = _normalize_to_png(top_bytes, 1280)
+    bottom_png = _normalize_to_png(bottom_bytes, 1280)
 
-    images: List[BytesIO] = [
-        _bytes_to_named_file(person_png, "person_front.png"),
-        _bytes_to_named_file(top_png, "top.png"),
-        _bytes_to_named_file(bottom_png, "bottom.png"),
-    ]
-
-    if shoes_bytes and len(shoes_bytes) > 0:
-        images.append(_bytes_to_named_file(_normalize_to_png(shoes_bytes, 1280), "shoes.png"))
-
-    if outer_bytes and len(outer_bytes) > 0:
-        images.append(_bytes_to_named_file(_normalize_to_png(outer_bytes, 1280), "outer.png"))
-
-    prompt = TRYON_OUTFIT_PROMPT
-    if prompt_extra and prompt_extra.strip():
-        prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
-
-    # вызов images.edit (multipart внутри SDK)
+    # tmp files (надежнее чем BytesIO для прокси)
+    paths: List[str] = []
     try:
-        result = client.images.edit(
-            model=TRYON_MODEL2,   # "gpt-image-1"
-            image=images,        # <-- ВОТ ТУТ file-like objects, не tuple
-            prompt=prompt,
-            size="1024x1024",
-            output_format="png",
-        )
+        paths.append(_write_tmp_png(person_png, "person_front"))
+        paths.append(_write_tmp_png(top_png, "top"))
+        paths.append(_write_tmp_png(bottom_png, "bottom"))
+
+        if shoes_bytes and len(shoes_bytes) > 0:
+            paths.append(_write_tmp_png(_normalize_to_png(shoes_bytes, 1280), "shoes"))
+        if outer_bytes and len(outer_bytes) > 0:
+            paths.append(_write_tmp_png(_normalize_to_png(outer_bytes, 1280), "outer"))
+
+        prompt = TRYON_OUTFIT_PROMPT
+        if prompt_extra and prompt_extra.strip():
+            prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
+
+        # открываем как реальные файлы
+        file_handles = [open(p, "rb") for p in paths]
+        try:
+            result = client.images.edit(
+                model=TRYON_MODEL2,      # строго gpt-image-1
+                image=file_handles,     # список файлов
+                prompt=prompt,
+                size="1024x1024",
+                output_format="png",
+            )
+        finally:
+            for fh in file_handles:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+        if not result.data or not getattr(result.data[0], "b64_json", None):
+            raise HTTPException(502, f"unexpected image response: {result}")
+
+        out_bytes = base64.b64decode(result.data[0].b64_json)
+        return Response(content=out_bytes, media_type="image/png")
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"tryon failed: {e}")
-
-    if not result.data or not getattr(result.data[0], "b64_json", None):
-        raise HTTPException(502, f"unexpected image response: {result}")
-
-    out_bytes = base64.b64decode(result.data[0].b64_json)
-    return Response(content=out_bytes, media_type="image/png")
+    finally:
+        # чистим временные файлы
+        for p in paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
