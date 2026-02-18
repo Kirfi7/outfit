@@ -298,13 +298,13 @@ except Exception:
 # OpenAI SDK (через AITunnel)
 from openai import OpenAI
 
-AITUNNEL_KEY = os.getenv("AITUNNEL_KEY", "sk-aitunnel-PgYvLoenSwR20GlGVhN5gxkKwYsXdNBx")
-if not AITUNNEL_KEY:
-    raise RuntimeError("AITUNNEL_KEY env var is not set")
+AITUNNEL_KEY2 = os.getenv("AITUNNEL_KEY2", "sk-aitunnel-PgYvLoenSwR20GlGVhN5gxkKwYsXdNBx")
+if not AITUNNEL_KEY2:
+    raise RuntimeError("AITUNNEL_KEY2 env var is not set")
 
 # ВАЖНО: base_url на AITunnel
 client = OpenAI(
-    api_key=AITUNNEL_KEY,
+    api_key=AITUNNEL_KEY2,
     base_url="https://api.aitunnel.ru/v1/",
 )
 
@@ -424,7 +424,7 @@ async def tryon_gpt_image_1_outfit(
     # 5) Вызов images.edit (multipart/form-data внутри SDK)
     try:
         result = client.images.edit(
-            model=TRYON_MODEL,     # "gpt-image-1"
+            model=TRYON_MODEL2,     # "gpt-image-1"
             image=files,           # СПИСОК картинок
             prompt=prompt,
             size="1024x1024",
