@@ -281,7 +281,7 @@ import os
 import base64
 from io import BytesIO
 from typing import Optional, List, Tuple
-
+import tempfile
 import requests
 from fastapi import UploadFile, File, HTTPException
 from fastapi.responses import Response
