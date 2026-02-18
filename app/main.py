@@ -3,7 +3,6 @@ import json
 import base64
 import re
 from typing import Optional, Any, Dict
-
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
