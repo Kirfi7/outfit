@@ -428,9 +428,6 @@ async def tryon_gpt_image_1_outfit(
             image=files,           # СПИСОК картинок
             prompt=prompt,
             size="1024x1024",
-            quality="high",
-            moderation="low",
-            output_format="png",
         )
     except Exception as e:
         raise HTTPException(502, f"tryon failed: {e}")
