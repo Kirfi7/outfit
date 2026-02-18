@@ -277,14 +277,38 @@ async def sizes_shoes(
 
     return ShoesOut(**out)
 
+import os
+import base64
+from io import BytesIO
+from typing import Optional, List, Tuple
+
+import requests
+from fastapi import UploadFile, File, HTTPException
 from fastapi.responses import Response
 
-# --- TRY-ON (flux) ---
-TRYON_MODEL = os.getenv("TRYON_MODEL", "flux.2-klein-4b")
-AITUNNEL_IMAGES_URL = os.getenv(
-    "AITUNNEL_IMAGES_URL",
-    "https://api.aitunnel.ru/v1/images/edit",
+from PIL import Image
+
+# pillow-heif (если прилетит HEIC)
+try:
+    import pillow_heif  # type: ignore
+    pillow_heif.register_heif_opener()
+except Exception:
+    pillow_heif = None
+
+# OpenAI SDK (через AITunnel)
+from openai import OpenAI
+
+AITUNNEL_KEY = os.getenv("AITUNNEL_KEY", "sk-aitunnel-PgYvLoenSwR20GlGVhN5gxkKwYsXdNBx")
+if not AITUNNEL_KEY:
+    raise RuntimeError("AITUNNEL_KEY env var is not set")
+
+# ВАЖНО: base_url на AITunnel
+client = OpenAI(
+    api_key=AITUNNEL_KEY,
+    base_url="https://api.aitunnel.ru/v1/",
 )
+
+TRYON_MODEL2 = os.getenv("TRYON_MODEL", "flux.2-klein-4b")
 
 TRYON_OUTFIT_PROMPT = """
 Сгенерируй реалистичную виртуальную примерку полного образа на человеке.
@@ -300,95 +324,58 @@ Image 5: верхняя одежда (outer) если есть
 - одеть человека в предоставленные вещи (сохрани цвет/материал/крой)
 - реалистичная посадка и складки, корректное освещение
 - не менять телосложение, не добавлять лишние предметы
+- не добавлять других людей
 - фотореализм, high quality
 """.strip()
 
 
-def _decode_aitunnel_image_resp(data: dict) -> bytes:
-    # достаем первый элемент
-    item = None
-    if isinstance(data, dict):
-        if "data" in data and data["data"]:
-            item = data["data"][0]
-        elif "images" in data and data["images"]:
-            item = data["images"][0]
+def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
+    """
+    Любой вход (heic/jpg/png/webp) -> PNG bytes + resize + EXIF orientation fix.
+    Для images.edit лучше PNG.
+    """
+    try:
+        img = Image.open(BytesIO(image_bytes))
+    except Exception as e:
+        hint = ""
+        if pillow_heif is None:
+            hint = " (HEIC? install pillow-heif)"
+        raise HTTPException(400, f"Cannot decode image{hint}: {e}")
 
-    if not isinstance(item, dict):
-        raise HTTPException(502, f"unexpected images response: {str(data)[:900]}")
+    # EXIF orientation fix (iPhone)
+    try:
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
 
-    # 1) b64_json / b64
-    b64 = item.get("b64_json") or item.get("b64")
-    if b64:
-        return base64.b64decode(b64)
+    # Resize
+    w, h = img.size
+    m = max(w, h)
+    if m > max_side:
+        scale = max_side / float(m)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-    # 2) url (может быть data-url)
-    url = item.get("url")
-    if url:
-        url = str(url).strip()
+    # PNG лучше держать в RGBA (не обязательно, но ок)
+    if img.mode not in ("RGBA", "RGB"):
+        img = img.convert("RGBA")
 
-        # data:image/png;base64,....
-        if url.startswith("data:"):
-            # берем только часть после запятой
-            try:
-                b64_part = url.split(",", 1)[1]
-                return base64.b64decode(b64_part)
-            except Exception as e:
-                raise HTTPException(502, f"bad data-url image: {e}")
-
-        # обычный URL на картинку
-        if url.startswith("http://") or url.startswith("https://"):
-            try:
-                r = requests.get(url, timeout=120)
-                if r.status_code != 200:
-                    raise HTTPException(502, f"cannot fetch image url {r.status_code}: {(r.text or '')[:300]}")
-                return r.content
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(502, f"cannot fetch image url: {e}")
-
-    raise HTTPException(502, f"unexpected images response: {str(data)[:900]}")
+    out = BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    return out.getvalue()
 
 
-def _call_aitunnel_image_multi(prompt: str, images_data_urls: list[str]) -> bytes:
-    headers = {
-        "Authorization": f"Bearer {AITUNNEL_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    # Попробуем сначала самый частый формат: images:[...]
-    payload1 = {
-        "model": TRYON_MODEL,
-        "prompt": prompt,
-        "images": images_data_urls,
-        "size": "1024x1024",
-        "response_format": "b64_json",
-    }
-
-    r = requests.post(AITUNNEL_IMAGES_URL, headers=headers, json=payload1, timeout=240)
-    if r.status_code == 200:
-        return _decode_aitunnel_image_resp(r.json())
-
-    # Фолбэк: некоторые прокси ждут image:[...]
-    payload2 = dict(payload1)
-    payload2.pop("images", None)
-    payload2["image"] = images_data_urls
-
-    r2 = requests.post(AITUNNEL_IMAGES_URL, headers=headers, json=payload2, timeout=240)
-    if r2.status_code == 200:
-        return _decode_aitunnel_image_resp(r2.json())
-
-    # Если оба не зашли — вернём детали
-    body1 = (r.text or "")[:800]
-    body2 = (r2.text or "")[:800]
-    raise HTTPException(
-        502,
-        f"aitunnel images error. payload1={r.status_code}:{body1} | payload2={r2.status_code}:{body2}",
-    )
+def _as_upload_tuple(png_bytes: bytes, name: str) -> Tuple[str, bytes, str]:
+    """
+    Формат для multipart в OpenAI SDK: (filename, bytes, mimetype)
+    """
+    return (f"{name}.png", png_bytes, "image/png")
 
 
-@app.post("/tryon/flux/outfit")
-async def tryon_flux_outfit(
+@app.post("/tryon/flux.2-klein-4b/outfit")
+async def tryon_gpt_image_1_outfit(
     person_front: UploadFile = File(...),
     top: UploadFile = File(...),
     bottom: UploadFile = File(...),
@@ -396,33 +383,61 @@ async def tryon_flux_outfit(
     outer: Optional[UploadFile] = File(None),
     prompt_extra: Optional[str] = None,
 ):
+    # 1) читаем человека
     p_bytes = await person_front.read()
     if not p_bytes:
         raise HTTPException(400, "person_front required")
 
-    # normalize person
-    p_jpeg = _normalize_to_jpeg(p_bytes, max_side=1280, quality=82)
-    images = [_to_data_url_jpeg(p_jpeg)]
+    # 2) читаем вещи
+    top_bytes = await top.read()
+    bottom_bytes = await bottom.read()
+    if not top_bytes:
+        raise HTTPException(400, "top is empty")
+    if not bottom_bytes:
+        raise HTTPException(400, "bottom is empty")
 
-    async def add_image(f: Optional[UploadFile], name: str):
-        if not f:
-            return
-        b = await f.read()
-        if not b:
-            raise HTTPException(400, f"{name} image is empty")
-        jpeg = _normalize_to_jpeg(b, max_side=1280, quality=82)
-        images.append(_to_data_url_jpeg(jpeg))
+    shoes_bytes = await shoes.read() if shoes else None
+    outer_bytes = await outer.read() if outer else None
 
-    await add_image(top, "top")
-    await add_image(bottom, "bottom")
-    await add_image(shoes, "shoes")
-    await add_image(outer, "outer")
+    # 3) нормализация -> PNG
+    person_png = _normalize_to_png(p_bytes, max_side=1280)
+    top_png = _normalize_to_png(top_bytes, max_side=1280)
+    bottom_png = _normalize_to_png(bottom_bytes, max_side=1280)
 
+    files: List[Tuple[str, bytes, str]] = [
+        _as_upload_tuple(person_png, "person_front"),
+        _as_upload_tuple(top_png, "top"),
+        _as_upload_tuple(bottom_png, "bottom"),
+    ]
+
+    if shoes_bytes:
+        files.append(_as_upload_tuple(_normalize_to_png(shoes_bytes, 1280), "shoes"))
+
+    if outer_bytes:
+        files.append(_as_upload_tuple(_normalize_to_png(outer_bytes, 1280), "outer"))
+
+    # 4) prompt
     prompt = TRYON_OUTFIT_PROMPT
-    if prompt_extra:
+    if prompt_extra and prompt_extra.strip():
         prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
 
-    # ВОТ ТУТ ГЛАВНОЕ: вызываем multi, а не _call_aitunnel_image
-    img_bytes = _call_aitunnel_image_multi(prompt, images)
+    # 5) Вызов images.edit (multipart/form-data внутри SDK)
+    try:
+        result = client.images.edit(
+            model=TRYON_MODEL,     # "gpt-image-1"
+            image=files,           # СПИСОК картинок
+            prompt=prompt,
+            size="1024x1024",
+            quality="high",
+            moderation="low",
+            output_format="png",
+        )
+    except Exception as e:
+        raise HTTPException(502, f"tryon failed: {e}")
+
+    if not result.data or not result.data[0].b64_json:
+        raise HTTPException(502, f"unexpected image response: {result}")
+
+    img_bytes = base64.b64decode(result.data[0].b64_json)
 
     return Response(content=img_bytes, media_type="image/png")
