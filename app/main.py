@@ -283,7 +283,7 @@ from fastapi.responses import Response
 TRYON_MODEL = os.getenv("TRYON_MODEL", "flux.2-klein-4b")
 AITUNNEL_IMAGES_URL = os.getenv(
     "AITUNNEL_IMAGES_URL",
-    "https://api.aitunnel.ru/v1/images/generations",
+    "https://api.aitunnel.ru/v1/images/edit",
 )
 
 TRYON_OUTFIT_PROMPT = """
