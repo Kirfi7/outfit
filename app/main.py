@@ -297,7 +297,7 @@ except Exception:
 
 app = FastAPI()
 
-GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY", "")
+GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY", "shds-StExbfcU2hbeyQoB1v3CGa229aV")
 if not GPTUNNEL_KEY:
     raise RuntimeError("GPTUNNEL_KEY env var is not set")
 
