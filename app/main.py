@@ -375,7 +375,7 @@ def _write_tmp_png(png_bytes: bytes, prefix: str) -> str:
 
 
 
-@app.post("/tryon/flux.2-klein-4b/outfit")
+@app.post("/tryon/outfit")
 async def tryon_gpt_image_1_outfit(
     person_front: UploadFile = File(...),
     top: UploadFile = File(...),
