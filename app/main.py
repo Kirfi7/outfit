@@ -279,58 +279,58 @@ app = FastAPI()
 
 import os
 import base64
-from io import BytesIO
-from typing import Optional, List, Tuple
 import tempfile
-import requests
-from fastapi import UploadFile, File, HTTPException
-from fastapi.responses import Response
+from io import BytesIO
+from typing import Optional, List
 
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import Response
 from PIL import Image
 
-# pillow-heif (если прилетит HEIC)
+# HEIC support (optional)
 try:
     import pillow_heif  # type: ignore
     pillow_heif.register_heif_opener()
 except Exception:
     pillow_heif = None
 
-# OpenAI SDK (через AITunnel)
 from openai import OpenAI
+
+app = FastAPI()
 
 AITUNNEL_KEY = os.getenv("AITUNNEL_KEY", "sk-aitunnel-PgYvLoenSwR20GlGVhN5gxkKwYsXdNBx")
 if not AITUNNEL_KEY:
     raise RuntimeError("AITUNNEL_KEY env var is not set")
 
-# ВАЖНО: base_url на AITunnel
 client = OpenAI(
     api_key=AITUNNEL_KEY,
     base_url="https://api.aitunnel.ru/v1/",
 )
 
-TRYON_MODEL = os.getenv("TRYON_MODEL2", "flux.2-klein-4b")
+# ВАЖНО: images.edit работает с gpt-image-*
+TRYON_MODEL = os.getenv("TRYON_EDIT_MODEL", "gpt-image-1")
 
 TRYON_OUTFIT_PROMPT = """
 Сгенерируй реалистичную виртуальную примерку полного образа на человеке.
 
-Image 1: человек (вид спереди)
-Image 2: верх (top)
-Image 3: низ (bottom)
-Image 4: обувь (shoes) если есть
-Image 5: верхняя одежда (outer) если есть
+Входные изображения:
+- Image 1: человек (вид спереди) — базовое фото, лицо/поза/фон сохранить
+- Image 2: верх (top)
+- Image 3: низ (bottom)
+- Image 4: обувь (shoes), если есть
+- Image 5: верхняя одежда (outer), если есть
 
 Требования:
-- сохранить лицо, позу и фон максимально близко к исходному фото
-- одеть человека в предоставленные вещи (сохрани цвет/материал/крой)
-- реалистичная посадка и складки, корректное освещение
-- не менять телосложение, не добавлять лишние предметы
-- не добавлять других людей
+- сохранить лицо, позу и фон максимально близко к исходному фото (Image 1)
+- одеть человека в предоставленные вещи, сохрани цвет/материал/крой
+- реалистичная посадка, складки, освещение
+- не менять телосложение
+- не добавлять других людей, не менять пол/возраст
 - фотореализм, high quality
 """.strip()
 
 
 def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
-    """Любой вход -> PNG bytes + resize + EXIF orientation fix."""
     try:
         img = Image.open(BytesIO(image_bytes))
     except Exception as e:
@@ -339,23 +339,20 @@ def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
             hint = " (HEIC? install pillow-heif)"
         raise HTTPException(400, f"Cannot decode image{hint}: {e}")
 
-    # EXIF orientation fix (iPhone)
+    # fix EXIF orientation (iPhone)
     try:
         from PIL import ImageOps
         img = ImageOps.exif_transpose(img)
     except Exception:
         pass
 
-    # Resize
     w, h = img.size
     m = max(w, h)
     if m > max_side:
         scale = max_side / float(m)
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
 
-    if img.mode not in ("RGBA", "RGB"):
+    if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGBA")
 
     out = BytesIO()
@@ -364,7 +361,6 @@ def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
 
 
 def _write_tmp_png(png_bytes: bytes, prefix: str) -> str:
-    """Сохраняем bytes в временный .png и возвращаем путь."""
     f = tempfile.NamedTemporaryFile(prefix=prefix + "_", suffix=".png", delete=False)
     try:
         f.write(png_bytes)
@@ -374,9 +370,8 @@ def _write_tmp_png(png_bytes: bytes, prefix: str) -> str:
         f.close()
 
 
-
 @app.post("/tryon/outfit")
-async def tryon_gpt_image_1_outfit(
+async def tryon_outfit(
     person_front: UploadFile = File(...),
     top: UploadFile = File(...),
     bottom: UploadFile = File(...),
@@ -384,57 +379,56 @@ async def tryon_gpt_image_1_outfit(
     outer: Optional[UploadFile] = File(None),
     prompt_extra: Optional[str] = None,
 ):
+    # read inputs
     p_bytes = await person_front.read()
-    top_bytes = await top.read()
-    bottom_bytes = await bottom.read()
+    t_bytes = await top.read()
+    b_bytes = await bottom.read()
 
     if not p_bytes:
-        raise HTTPException(400, "person_front required")
-    if not top_bytes:
+        raise HTTPException(400, "person_front is empty")
+    if not t_bytes:
         raise HTTPException(400, "top is empty")
-    if not bottom_bytes:
+    if not b_bytes:
         raise HTTPException(400, "bottom is empty")
 
-    shoes_bytes = await shoes.read() if shoes else None
-    outer_bytes = await outer.read() if outer else None
+    s_bytes = await shoes.read() if shoes else None
+    o_bytes = await outer.read() if outer else None
 
     # normalize -> png
-    person_png = _normalize_to_png(p_bytes, 1280)
-    top_png = _normalize_to_png(top_bytes, 1280)
-    bottom_png = _normalize_to_png(bottom_bytes, 1280)
+    p_png = _normalize_to_png(p_bytes, 1280)
+    t_png = _normalize_to_png(t_bytes, 1280)
+    b_png = _normalize_to_png(b_bytes, 1280)
 
-    # tmp files (надежнее чем BytesIO для прокси)
     paths: List[str] = []
-    try:
-        paths.append(_write_tmp_png(person_png, "person_front"))
-        paths.append(_write_tmp_png(top_png, "top"))
-        paths.append(_write_tmp_png(bottom_png, "bottom"))
+    file_handles = []
 
-        if shoes_bytes and len(shoes_bytes) > 0:
-            paths.append(_write_tmp_png(_normalize_to_png(shoes_bytes, 1280), "shoes"))
-        if outer_bytes and len(outer_bytes) > 0:
-            paths.append(_write_tmp_png(_normalize_to_png(outer_bytes, 1280), "outer"))
+    try:
+        paths.append(_write_tmp_png(p_png, "person_front"))
+        paths.append(_write_tmp_png(t_png, "top"))
+        paths.append(_write_tmp_png(b_png, "bottom"))
+
+        if s_bytes and len(s_bytes) > 0:
+            paths.append(_write_tmp_png(_normalize_to_png(s_bytes, 1280), "shoes"))
+        if o_bytes and len(o_bytes) > 0:
+            paths.append(_write_tmp_png(_normalize_to_png(o_bytes, 1280), "outer"))
+
+        # open as real files for multipart
+        file_handles = [open(p, "rb") for p in paths]
 
         prompt = TRYON_OUTFIT_PROMPT
         if prompt_extra and prompt_extra.strip():
             prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
 
-        # открываем как реальные файлы
-        file_handles = [open(p, "rb") for p in paths]
-        try:
-            result = client.images.edit(
-                model=TRYON_MODEL,      # строго gpt-image-1
-                image=file_handles,     # список файлов
-                prompt=prompt,
-                size="1024x1024",
-                output_format="png",
-            )
-        finally:
-            for fh in file_handles:
-                try:
-                    fh.close()
-                except Exception:
-                    pass
+        # IMPORTANT: images.edit here expects gpt-image-* model
+        # If you set TRYON_MODEL to flux.* — you will likely get "No valid image files provided".
+        result = client.images.edit(
+            model=TRYON_MODEL,          # e.g. "gpt-image-1"
+            image=file_handles,         # list[BinaryIO]
+            prompt=prompt,
+            size="1024x1024",
+            output_format="png",
+            # quality / moderation можно добавить если нужно
+        )
 
         if not result.data or not getattr(result.data[0], "b64_json", None):
             raise HTTPException(502, f"unexpected image response: {result}")
@@ -447,7 +441,11 @@ async def tryon_gpt_image_1_outfit(
     except Exception as e:
         raise HTTPException(502, f"tryon failed: {e}")
     finally:
-        # чистим временные файлы
+        for fh in file_handles:
+            try:
+                fh.close()
+            except Exception:
+                pass
         for p in paths:
             try:
                 os.remove(p)
