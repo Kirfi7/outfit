@@ -299,7 +299,10 @@ app = FastAPI()
 
 # ================== HARD-CODED CONFIG (for local test) ==================
 
-GEMINI_MODEL = "gemini-2.5-flash-image"
+# GEMINI_MODEL = "gemini-2.5-flash-image"
+GEMINI_MODEL = "gemini-3-pro-image-preview"
+IMAGE_AR = "16:9"      # или 1:1 / 9:16 и т.д.
+IMAGE_SIZE = "1K"      # "1K" | "2K" | "4K"
 
 # Прокси: обычно схема http:// даже если тип "HTTPS" (это про CONNECT-туннель)
 # ВСТАВЬ СВОИ LOGIN/PASSWORD/IP/PORT
@@ -427,28 +430,29 @@ async def _gemini_generate_image(
     payload = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
-            "responseModalities": ["IMAGE"]
+            "imageConfig": {
+                "aspectRatio": IMAGE_AR,   # напр. "16:9"
+                "imageSize": IMAGE_SIZE,   # "1K" | "2K" | "4K"
+            }
         },
     }
 
-    timeout = httpx.Timeout(connect=30.0, read=300.0, write=60.0, pool=60.0)
+    timeout = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=60.0)
     async with _make_client(timeout) as client:
         r = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
         if r.status_code < 200 or r.status_code >= 300:
             raise HTTPException(502, f"gemini {r.status_code}: {(r.text or '')[:1500]}")
         data = r.json()
 
-    # достаем картинку из ответа
     for cand in (data.get("candidates") or []):
         content = (cand or {}).get("content") or {}
         for part in (content.get("parts") or []):
             inline = (part or {}).get("inlineData")
-            if inline and isinstance(inline, dict) and inline.get("data"):
+            if inline and inline.get("data"):
                 mime = inline.get("mimeType") or "image/png"
                 return base64.b64decode(inline["data"]), mime
 
     raise HTTPException(502, f"gemini returned no image: {str(data)[:2000]}")
-
 
 @app.post("/tryon/outfit")
 async def tryon_outfit(
