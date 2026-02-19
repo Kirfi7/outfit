@@ -298,7 +298,7 @@ except Exception:
 app = FastAPI()
 
 # ================== HARD-CODED CONFIG (for local test) ==================
-GEMINI_API_KEY = "AIzaSyAq09NEzkyit2K-bsKPDjG1bLJSmv1GQOg"
+GEMINI_API_KEY = "AIzaSyArLoWTDyXJT9HyyyXRoMiXnSUwdarMVYI"
 # GEMINI_MODEL = "gemini-2.5-flash-image"
 GEMINI_MODEL = "gemini-3-pro-image-preview"
 IMAGE_AR = "16:9"      # или 1:1 / 9:16 и т.д.
