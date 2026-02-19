@@ -298,17 +298,17 @@ except Exception:
 # OpenAI SDK (через AITunnel)
 from openai import OpenAI
 
-AITUNNEL_KEY2 = os.getenv("AITUNNEL_KEY2", "sk-aitunnel-PgYvLoenSwR20GlGVhN5gxkKwYsXdNBx")
-if not AITUNNEL_KEY2:
-    raise RuntimeError("AITUNNEL_KEY2 env var is not set")
+AITUNNEL_KEY = os.getenv("AITUNNEL_KEY", "sk-aitunnel-PgYvLoenSwR20GlGVhN5gxkKwYsXdNBx")
+if not AITUNNEL_KEY:
+    raise RuntimeError("AITUNNEL_KEY env var is not set")
 
 # ВАЖНО: base_url на AITunnel
 client = OpenAI(
-    api_key=AITUNNEL_KEY2,
+    api_key=AITUNNEL_KEY,
     base_url="https://api.aitunnel.ru/v1/",
 )
 
-TRYON_MODEL2 = os.getenv("TRYON_MODEL2", "flux.2-klein-4b")
+TRYON_MODEL = os.getenv("TRYON_MODEL2", "flux.2-klein-4b")
 
 TRYON_OUTFIT_PROMPT = """
 Сгенерируй реалистичную виртуальную примерку полного образа на человеке.
@@ -423,7 +423,7 @@ async def tryon_gpt_image_1_outfit(
         file_handles = [open(p, "rb") for p in paths]
         try:
             result = client.images.edit(
-                model=TRYON_MODEL2,      # строго gpt-image-1
+                model=TRYON_MODEL,      # строго gpt-image-1
                 image=file_handles,     # список файлов
                 prompt=prompt,
                 size="1024x1024",
