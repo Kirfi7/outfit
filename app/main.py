@@ -278,12 +278,13 @@ app = FastAPI()
 #     return ShoesOut(**out)
 
 import os
+import time
 import base64
-import tempfile
 from io import BytesIO
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import requests
+from fastapi import UploadFile, File, HTTPException
 from fastapi.responses import Response
 from PIL import Image
 
@@ -294,43 +295,50 @@ try:
 except Exception:
     pillow_heif = None
 
-from openai import OpenAI
 
-app = FastAPI()
+# ============ GPTUNNEL CreativeLab config ============
+GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY") or os.getenv("AITUNNEL_KEY")
+if not GPTUNNEL_KEY:
+    raise RuntimeError("GPTUNNEL_KEY (или AITUNNEL_KEY) env var is not set")
 
-AITUNNEL_KEY = os.getenv("AITUNNEL_KEY", "sk-aitunnel-PgYvLoenSwR20GlGVhN5gxkKwYsXdNBx")
-if not AITUNNEL_KEY:
-    raise RuntimeError("AITUNNEL_KEY env var is not set")
+GPTUNNEL_BASE = os.getenv("GPTUNNEL_BASE_URL", "https://gptunnel.ru")
+GPTUNNEL_CREATE_URL = f"{GPTUNNEL_BASE}/v1/media/create"
+GPTUNNEL_RESULT_URL = f"{GPTUNNEL_BASE}/v1/media/result"
 
-client = OpenAI(
-    api_key=AITUNNEL_KEY,
-    base_url="https://api.aitunnel.ru/v1/",
-)
+# Модель примерки (как ты хочешь)
+TRYON_MODEL = os.getenv("TRYON_MODEL", "nano-banana")
 
-# ВАЖНО: images.edit работает с gpt-image-*
-TRYON_MODEL = os.getenv("TRYON_EDIT_MODEL", "gpt-image-1")
+# Тайминги поллинга
+TRYON_POLL_TIMEOUT_SEC = int(os.getenv("TRYON_POLL_TIMEOUT_SEC", "180"))
+TRYON_POLL_INTERVAL_SEC = float(os.getenv("TRYON_POLL_INTERVAL_SEC", "1.2"))
+
+# Соотношение сторон (по докам именно ar, не size)
+# TRYON_AR = os.getenv("TRYON_AR", "1:1")  # '1:1', '16:9', '9:16', '4:3', '3:4'
+
 
 TRYON_OUTFIT_PROMPT = """
 Сгенерируй реалистичную виртуальную примерку полного образа на человеке.
 
-Входные изображения:
-- Image 1: человек (вид спереди) — базовое фото, лицо/поза/фон сохранить
-- Image 2: верх (top)
-- Image 3: низ (bottom)
-- Image 4: обувь (shoes), если есть
-- Image 5: верхняя одежда (outer), если есть
+Image 1: человек (вид спереди) — базовое фото, лицо/поза/фон сохранить
+Image 2: верх (top)
+Image 3: низ (bottom)
+Image 4: обувь (shoes) если есть
+Image 5: верхняя одежда (outer) если есть
 
 Требования:
 - сохранить лицо, позу и фон максимально близко к исходному фото (Image 1)
 - одеть человека в предоставленные вещи, сохрани цвет/материал/крой
 - реалистичная посадка, складки, освещение
 - не менять телосложение
-- не добавлять других людей, не менять пол/возраст
+- не добавлять других людей и не менять пол/возраст
 - фотореализм, high quality
 """.strip()
 
 
-def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
+def _normalize_to_jpeg(image_bytes: bytes, max_side: int = 1280, quality: int = 82) -> bytes:
+    """
+    Любой вход (heic/jpg/png/webp) -> JPEG bytes + resize + EXIF orientation fix.
+    """
     try:
         img = Image.open(BytesIO(image_bytes))
     except Exception as e:
@@ -339,12 +347,15 @@ def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
             hint = " (HEIC? install pillow-heif)"
         raise HTTPException(400, f"Cannot decode image{hint}: {e}")
 
-    # fix EXIF orientation (iPhone)
+    # EXIF orientation fix (iPhone)
     try:
         from PIL import ImageOps
         img = ImageOps.exif_transpose(img)
     except Exception:
         pass
+
+    if img.mode != "RGB":
+        img = img.convert("RGB")
 
     w, h = img.size
     m = max(w, h)
@@ -352,23 +363,114 @@ def _normalize_to_png(image_bytes: bytes, max_side: int = 1280) -> bytes:
         scale = max_side / float(m)
         img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
 
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGBA")
-
     out = BytesIO()
-    img.save(out, format="PNG", optimize=True)
+    img.save(out, format="JPEG", quality=quality, optimize=True)
     return out.getvalue()
 
 
-def _write_tmp_png(png_bytes: bytes, prefix: str) -> str:
-    f = tempfile.NamedTemporaryFile(prefix=prefix + "_", suffix=".png", delete=False)
-    try:
-        f.write(png_bytes)
-        f.flush()
-        return f.name
-    finally:
-        f.close()
+def _to_data_url_jpeg(jpeg_bytes: bytes) -> str:
+    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
 
+
+def _auth_headers() -> Dict[str, str]:
+    # По докам gptunnel: Authorization: YOUR_API_KEY (без Bearer)
+    return {
+        "Authorization": GPTUNNEL_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+def _decode_data_url_image(url: str) -> Optional[bytes]:
+    url = (url or "").strip()
+    if not url.startswith("data:"):
+        return None
+    # data:image/png;base64,AAAA
+    try:
+        b64_part = url.split(",", 1)[1]
+        return base64.b64decode(b64_part)
+    except Exception:
+        return None
+
+
+def _fetch_image_bytes(url: str) -> bytes:
+    # 1) data-url
+    maybe = _decode_data_url_image(url)
+    if maybe:
+        return maybe
+
+    # 2) обычная ссылка
+    try:
+        r = requests.get(url, timeout=180)
+    except Exception as e:
+        raise HTTPException(502, f"cannot fetch result image: {e}")
+
+    if r.status_code < 200 or r.status_code >= 300:
+        raise HTTPException(502, f"cannot fetch result image {r.status_code}: {(r.text or '')[:300]}")
+    return r.content
+
+
+def _media_create(prompt: str, images: List[str], model: str, ar: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "images": images,  # Array<string> links; data-url тоже "link"
+        "ar": ar,
+    }
+    try:
+        r = requests.post(GPTUNNEL_CREATE_URL, headers=_auth_headers(), json=payload, timeout=120)
+    except Exception as e:
+        raise HTTPException(502, f"gptunnel create failed: {e}")
+
+    if r.status_code < 200 or r.status_code >= 300:
+        raise HTTPException(502, f"gptunnel create {r.status_code}: {(r.text or '')[:1200]}")
+
+    data = r.json()
+    # ожидаем { code: 0, id: "...", status: "idle", ... }
+    if not isinstance(data, dict) or not data.get("id"):
+        raise HTTPException(502, f"unexpected create response: {str(data)[:1200]}")
+    return data
+
+
+def _media_result(task_id: str) -> Dict[str, Any]:
+    payload = {"task_id": task_id}
+    try:
+        r = requests.post(GPTUNNEL_RESULT_URL, headers=_auth_headers(), json=payload, timeout=60)
+    except Exception as e:
+        raise HTTPException(502, f"gptunnel result failed: {e}")
+
+    if r.status_code < 200 or r.status_code >= 300:
+        raise HTTPException(502, f"gptunnel result {r.status_code}: {(r.text or '')[:1200]}")
+
+    data = r.json()
+    if not isinstance(data, dict) or not data.get("id"):
+        raise HTTPException(502, f"unexpected result response: {str(data)[:1200]}")
+    return data
+
+
+def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float) -> Dict[str, Any]:
+    t0 = time.time()
+    last = None
+    while True:
+        last = _media_result(task_id)
+        status = (last.get("status") or "").lower()
+
+        if status == "done":
+            return last
+
+        # иногда может быть "error"/"failed" — на всякий
+        if status in ("error", "failed"):
+            raise HTTPException(502, f"tryon failed status={status}: {str(last)[:1200]}")
+
+        if time.time() - t0 > timeout_sec:
+            raise HTTPException(504, f"tryon timeout after {timeout_sec}s: {str(last)[:1200]}")
+
+        time.sleep(interval_sec)
+
+
+# ------------------ ENDPOINT ------------------
+# ВАЖНО: этот декоратор должен быть в том же файле, где твой app = FastAPI()
+# app.post("/tryon/outfit") ниже — просто вставь как есть (или поправь под свой app)
 
 @app.post("/tryon/outfit")
 async def tryon_outfit(
@@ -378,8 +480,10 @@ async def tryon_outfit(
     shoes: Optional[UploadFile] = File(None),
     outer: Optional[UploadFile] = File(None),
     prompt_extra: Optional[str] = None,
+    model: Optional[str] = None,   # можно передавать ?model=nano-banana
+    # ar: Optional[str] = None,      # можно передавать ?ar=3:4
 ):
-    # read inputs
+    # 1) read inputs
     p_bytes = await person_front.read()
     t_bytes = await top.read()
     b_bytes = await bottom.read()
@@ -394,60 +498,38 @@ async def tryon_outfit(
     s_bytes = await shoes.read() if shoes else None
     o_bytes = await outer.read() if outer else None
 
-    # normalize -> png
-    p_png = _normalize_to_png(p_bytes, 1280)
-    t_png = _normalize_to_png(t_bytes, 1280)
-    b_png = _normalize_to_png(b_bytes, 1280)
+    # 2) normalize -> jpeg
+    images: List[str] = []
+    images.append(_to_data_url_jpeg(_normalize_to_jpeg(p_bytes, 1280, 82)))
+    images.append(_to_data_url_jpeg(_normalize_to_jpeg(t_bytes, 1280, 82)))
+    images.append(_to_data_url_jpeg(_normalize_to_jpeg(b_bytes, 1280, 82)))
 
-    paths: List[str] = []
-    file_handles = []
+    if s_bytes:
+        images.append(_to_data_url_jpeg(_normalize_to_jpeg(s_bytes, 1280, 82)))
+    if o_bytes:
+        images.append(_to_data_url_jpeg(_normalize_to_jpeg(o_bytes, 1280, 82)))
 
-    try:
-        paths.append(_write_tmp_png(p_png, "person_front"))
-        paths.append(_write_tmp_png(t_png, "top"))
-        paths.append(_write_tmp_png(b_png, "bottom"))
+    # 3) prompt
+    prompt = TRYON_OUTFIT_PROMPT
+    if prompt_extra and prompt_extra.strip():
+        prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
 
-        if s_bytes and len(s_bytes) > 0:
-            paths.append(_write_tmp_png(_normalize_to_png(s_bytes, 1280), "shoes"))
-        if o_bytes and len(o_bytes) > 0:
-            paths.append(_write_tmp_png(_normalize_to_png(o_bytes, 1280), "outer"))
+    use_model = (model or TRYON_MODEL).strip()
+    # use_ar = (ar or TRYON_AR).strip()
 
-        # open as real files for multipart
-        file_handles = [open(p, "rb") for p in paths]
+    # 4) create task
+    created = _media_create(prompt=prompt, images=images, model=use_model)
+    task_id = created["id"]
 
-        prompt = TRYON_OUTFIT_PROMPT
-        if prompt_extra and prompt_extra.strip():
-            prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
+    # 5) wait result
+    done = _wait_for_done(task_id, TRYON_POLL_TIMEOUT_SEC, TRYON_POLL_INTERVAL_SEC)
+    url = done.get("url")
+    if not url:
+        raise HTTPException(502, f"tryon done but url is null: {str(done)[:1200]}")
 
-        # IMPORTANT: images.edit here expects gpt-image-* model
-        # If you set TRYON_MODEL to flux.* — you will likely get "No valid image files provided".
-        result = client.images.edit(
-            model=TRYON_MODEL,          # e.g. "gpt-image-1"
-            image=file_handles,         # list[BinaryIO]
-            prompt=prompt,
-            size="1024x1024",
-            output_format="png",
-            # quality / moderation можно добавить если нужно
-        )
+    # 6) fetch image bytes
+    out_bytes = _fetch_image_bytes(str(url))
 
-        if not result.data or not getattr(result.data[0], "b64_json", None):
-            raise HTTPException(502, f"unexpected image response: {result}")
-
-        out_bytes = base64.b64decode(result.data[0].b64_json)
-        return Response(content=out_bytes, media_type="image/png")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"tryon failed: {e}")
-    finally:
-        for fh in file_handles:
-            try:
-                fh.close()
-            except Exception:
-                pass
-        for p in paths:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    # content-type: часто webp/png; но мы просто отдаём как image/*
+    # если хочешь строго — можно определить по сигнатуре.
+    return Response(content=out_bytes, media_type="image/png")
