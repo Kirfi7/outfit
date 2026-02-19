@@ -410,12 +410,12 @@ def _fetch_image_bytes(url: str) -> bytes:
     return r.content
 
 
-def _media_create(prompt: str, images: List[str], model: str, ar: str) -> Dict[str, Any]:
+def _media_create(prompt: str, images: List[str], model: str) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model": model,
         "prompt": prompt,
         "images": images,  # Array<string> links; data-url тоже "link"
-        "ar": ar,
+        # "ar": ar,
     }
     try:
         r = requests.post(GPTUNNEL_CREATE_URL, headers=_auth_headers(), json=payload, timeout=120)
