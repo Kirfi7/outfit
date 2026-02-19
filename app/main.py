@@ -297,7 +297,7 @@ except Exception:
 
 
 # ============ GPTUNNEL CreativeLab config ============
-GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY") or os.getenv("AITUNNEL_KEY")
+GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY", "shds-uQPENRu1XB2rx9FL4yqg0stls9r")
 if not GPTUNNEL_KEY:
     raise RuntimeError("GPTUNNEL_KEY (или AITUNNEL_KEY) env var is not set")
 
