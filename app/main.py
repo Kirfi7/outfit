@@ -308,7 +308,7 @@ GPTUNNEL_BASE = os.getenv("GPTUNNEL_BASE_URL", "https://gptunnel.ru").rstrip("/"
 GPTUNNEL_CREATE_URL = f"{GPTUNNEL_BASE}/v1/media/create"
 GPTUNNEL_RESULT_URL = f"{GPTUNNEL_BASE}/v1/media/result"
 
-TRYON_MODEL_DEFAULT = os.getenv("TRYON_MODEL", "nano-banana-2")
+TRYON_MODEL_DEFAULT = os.getenv("TRYON_MODEL", "nano-banana")
 
 TRYON_POLL_TIMEOUT_SEC = int(os.getenv("TRYON_POLL_TIMEOUT_SEC", "600"))
 TRYON_POLL_INTERVAL_SEC = float(os.getenv("TRYON_POLL_INTERVAL_SEC", "1.2"))
