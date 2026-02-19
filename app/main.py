@@ -285,7 +285,7 @@ from io import BytesIO
 from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import Response
 from PIL import Image
 
@@ -300,54 +300,58 @@ except Exception:
 app = FastAPI()
 
 # ============ GPTUNNEL CreativeLab config ============
-GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY", "shds-StExbfcU2hbeyQoB1v3CGa229aV")
+GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY")
 if not GPTUNNEL_KEY:
     raise RuntimeError("GPTUNNEL_KEY env var is not set")
 
-GPTUNNEL_BASE = os.getenv("GPTUNNEL_BASE_URL", "https://gptunnel.ru")
+GPTUNNEL_BASE = os.getenv("GPTUNNEL_BASE_URL", "https://gptunnel.ru").rstrip("/")
 GPTUNNEL_CREATE_URL = f"{GPTUNNEL_BASE}/v1/media/create"
 GPTUNNEL_RESULT_URL = f"{GPTUNNEL_BASE}/v1/media/result"
 
 TRYON_MODEL_DEFAULT = os.getenv("TRYON_MODEL", "nano-banana")
 
-# Поллинг
 TRYON_POLL_TIMEOUT_SEC = int(os.getenv("TRYON_POLL_TIMEOUT_SEC", "600"))
 TRYON_POLL_INTERVAL_SEC = float(os.getenv("TRYON_POLL_INTERVAL_SEC", "1.2"))
 
-ALLOWED_AR = ("1:1", "4:3", "3:4", "16:9", "9:16")
+ALLOWED_AR = ["1:1", "16:9", "9:16", "4:3", "3:4"]
 
-
+# ---------------- PROMPT ----------------
 TRYON_OUTFIT_PROMPT = """
 ЗАДАЧА: ФОТО-РЕДАКТИРОВАНИЕ (НЕ генерация новой сцены).
-Используй последнее изображение как базовое фото человека и измени ТОЛЬКО одежду.
+Нужно отредактировать базовое фото человека (ПОСЛЕДНИЙ Image), изменив ТОЛЬКО его одежду.
 
-ПОРЯДОК ИЗОБРАЖЕНИЙ (строго):
-1) Image 1 = TOP-референс (в одном изображении: слева весь верх, справа крупный план принта/надписи).
-2) Image 2 = BOTTOM-референс (низ).
-3) Image 3 = SHOES-референс (обувь), если есть.
-4) Image 4 = OUTER-референс (верхняя одежда), если есть.
-5) Image 5 = ЧЕЛОВЕК (БАЗА). Это фото должно остаться тем же кадром.
+ПОРЯДОК ИЗОБРАЖЕНИЙ (КРИТИЧНО):
+- Image 1: PRINT_CROP (крупный план принта на футболке/верху) — ЭТАЛОН ПРИНТА. Должен совпасть 1:1.
+- Image 2: TOP_FULL (полное фото верха) — цвет/крой/посадка верха.
+- Image 3: BOTTOM (низ)
+- Image 4: SHOES (если есть)
+- Image 5: OUTER (если есть)
+- Последний Image: PERSON_BASE (человек) — БАЗОВОЕ ФОТО, его нельзя менять кроме одежды.
 
-РАЗРЕШЕНО ИЗМЕНИТЬ ТОЛЬКО:
-- одежду на человеке (верх/низ/обувь/верхняя одежда).
+РАЗРЕШЕНО МЕНЯТЬ ТОЛЬКО:
+- верх/низ/обувь/верхнюю одежду на человеке.
 
-КРИТИЧЕСКИ ЗАПРЕЩЕНО:
-- менять лицо/личность/пол/возраст/телосложение/позу/руки/ноги
-- менять фон/помещение/свет/перспективу/ракурс/кадрирование
-- добавлять других людей, манекены, лишние предметы
+ЗАПРЕЩЕНО (СТРОГО):
+- менять лицо/личность/пол/возраст/бороду/прическу
+- менять телосложение/рост/пропорции/позу/положение рук и ног
+- менять фон/помещение/мебель/свет/перспективу/ракурс
+- менять кадрирование/масштаб (не приближать, не переносить в другую комнату)
+- добавлять других людей/предметы
 
-ОЧЕНЬ ВАЖНО ПРО TOP:
-- Принт/надпись на футболке должен быть перенесён ТОЧНО как на Image 1.
-- Не перерисовывать, не заменять логотипы/текст, не придумывать новый принт.
-- Если принт не читается — используй правую часть Image 1 (крупный план) как источник истины.
+КРИТИЧНО ПРО ПРИНТ:
+- Принт на груди должен точно соответствовать Image 1 (PRINT_CROP): та же форма, контуры, цвета, расположение.
+- Не перерисовывай принт "по мотивам" и не подменяй текст/картинку.
 
-Качество:
-- фотореализм, естественные складки, тени и освещение как на базовом фото человека.
+ЕСЛИ чего-то нет:
+- Если SHOES или OUTER не переданы — НЕ добавляй их.
+
+ВЫХОД:
+Одно фотореалистичное изображение: тот же человек/фон, но в предоставленных вещах.
 """.strip()
 
 
 def _auth_headers() -> Dict[str, str]:
-    # по докам: Authorization: KEY (без Bearer)
+    # По докам GPTunnel: Authorization: KEY (без Bearer)
     return {"Authorization": GPTUNNEL_KEY, "Content-Type": "application/json"}
 
 
@@ -355,22 +359,22 @@ def _open_image(image_bytes: bytes) -> Image.Image:
     try:
         img = Image.open(BytesIO(image_bytes))
     except Exception as e:
-        hint = ""
-        if pillow_heif is None:
-            hint = " (HEIC? install pillow-heif)"
+        hint = " (HEIC? install pillow-heif)" if pillow_heif is None else ""
         raise HTTPException(400, f"Cannot decode image{hint}: {e}")
 
-    # EXIF orientation fix (iPhone)
+    # EXIF orientation fix
     try:
         from PIL import ImageOps
         img = ImageOps.exif_transpose(img)
     except Exception:
         pass
 
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     return img
 
 
-def _resize_max_side(img: Image.Image, max_side: int) -> Image.Image:
+def _resize_max(img: Image.Image, max_side: int) -> Image.Image:
     w, h = img.size
     m = max(w, h)
     if m <= max_side:
@@ -379,86 +383,41 @@ def _resize_max_side(img: Image.Image, max_side: int) -> Image.Image:
     return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
 
 
-def _to_jpeg_bytes(img: Image.Image, max_side: int, quality: int) -> bytes:
-    img = _resize_max_side(img, max_side)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+def _encode_jpeg(img: Image.Image, quality: int) -> bytes:
     out = BytesIO()
     img.save(out, format="JPEG", quality=quality, optimize=True)
     return out.getvalue()
 
 
-def _to_png_bytes(img: Image.Image, max_side: int) -> bytes:
-    img = _resize_max_side(img, max_side)
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGBA")
-    out = BytesIO()
-    img.save(out, format="PNG", optimize=True)
-    return out.getvalue()
+def _to_data_url_jpeg(jpeg_bytes: bytes) -> str:
+    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
 
 
-def _data_url(mime: str, b: bytes) -> str:
-    return f"data:{mime};base64," + base64.b64encode(b).decode("utf-8")
+def _make_center_crop(img: Image.Image, crop_w: float = 0.55, crop_h: float = 0.55) -> Image.Image:
+    """
+    Простой кроп по центру (для каталожных футболок на белом фоне это обычно попадает в принт).
+    """
+    w, h = img.size
+    cw = int(w * crop_w)
+    ch = int(h * crop_h)
+    left = max(0, (w - cw) // 2)
+    top = max(0, (h - ch) // 2)
+    return img.crop((left, top, left + cw, top + ch))
 
 
-def _choose_ar_from_base(base_img: Image.Image) -> str:
-    # выбираем ближайшее из допустимых
-    w, h = base_img.size
+def _pick_ar_from_size(w: int, h: int) -> str:
     r = w / float(h)
-
-    candidates = {
-        "1:1": 1.0,
-        "4:3": 4.0 / 3.0,
-        "3:4": 3.0 / 4.0,
-        "16:9": 16.0 / 9.0,
-        "9:16": 9.0 / 16.0,
-    }
-    best = min(candidates.items(), key=lambda kv: abs(kv[1] - r))[0]
-    return best
-
-
-def _make_top_composite_with_print_zoom(top_img: Image.Image) -> Image.Image:
-    """
-    Делаем одно изображение TOP-референса:
-    слева — весь товар,
-    справа — увеличенный центр (зона принта), чтобы модель точно считала принт.
-    """
-    # 1) приводим к RGB/RGBA и ресайзим весь top умеренно
-    full = top_img.copy()
-    if full.mode not in ("RGB", "RGBA"):
-        full = full.convert("RGBA")
-    full = _resize_max_side(full, 1400)  # важно: выше, чем остальные, чтобы принт был читабельным
-
-    fw, fh = full.size
-
-    # 2) кроп центра (обычно принт в центральной зоне)
-    # можно подкрутить доли, но это неплохой дефолт для футболки
-    x0 = int(fw * 0.25)
-    x1 = int(fw * 0.75)
-    y0 = int(fh * 0.22)
-    y1 = int(fh * 0.72)
-    crop = full.crop((x0, y0, x1, y1))
-
-    # 3) увеличиваем кроп до высоты full (чтобы текст реально читался)
-    cw, ch = crop.size
-    scale = fh / float(ch)
-    crop_big = crop.resize((max(1, int(cw * scale)), fh), Image.Resampling.LANCZOS)
-
-    # 4) канва: full + небольшой gap + crop_big (подрежем crop_big по ширине, чтобы не раздувать)
-    gap = 20
-    max_right_w = int(fw * 0.85)
-    if crop_big.size[0] > max_right_w:
-        # вписываем
-        crop_big = crop_big.resize((max_right_w, fh), Image.Resampling.LANCZOS)
-
-    canvas_w = fw + gap + crop_big.size[0]
-    canvas_h = fh
-    mode = "RGBA" if ("A" in full.mode or "A" in crop_big.mode) else "RGB"
-    canvas = Image.new(mode, (canvas_w, canvas_h), (255, 255, 255, 0) if mode == "RGBA" else (255, 255, 255))
-
-    canvas.paste(full, (0, 0))
-    canvas.paste(crop_big, (fw + gap, 0))
-    return canvas
+    # близко к квадрату
+    if 0.9 <= r <= 1.1:
+        return "1:1"
+    # портрет
+    if r < 1.0:
+        # 3:4 = 0.75, 9:16 = 0.5625
+        return "9:16" if r < 0.67 else "3:4"
+    # ландшафт
+    # 4:3 = 1.333, 16:9 = 1.777
+    return "16:9" if r > 1.55 else "4:3"
 
 
 def _decode_data_url_image(url: str) -> Optional[bytes]:
@@ -466,70 +425,55 @@ def _decode_data_url_image(url: str) -> Optional[bytes]:
     if not url.startswith("data:"):
         return None
     try:
-        return base64.b64decode(url.split(",", 1)[1])
+        b64_part = url.split(",", 1)[1]
+        return base64.b64decode(b64_part)
     except Exception:
         return None
 
 
-async def _fetch_image_bytes(url: str) -> bytes:
+async def _fetch_image_bytes(url: str, client: httpx.AsyncClient) -> bytes:
     maybe = _decode_data_url_image(url)
     if maybe:
         return maybe
-
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.get(url)
-        if r.status_code < 200 or r.status_code >= 300:
-            raise HTTPException(502, f"cannot fetch result image {r.status_code}: {(r.text or '')[:300]}")
-        return r.content
+    r = await client.get(url)
+    if r.status_code < 200 or r.status_code >= 300:
+        raise HTTPException(502, f"cannot fetch result image {r.status_code}: {(r.text or '')[:300]}")
+    return r.content
 
 
-async def _media_create(prompt: str, images: List[str], model: str, ar: Optional[str]) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        "images": images,
-    }
-    if ar:
-        payload["ar"] = ar  # '1:1','16:9','9:16','4:3','3:4'
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(GPTUNNEL_CREATE_URL, headers=_auth_headers(), json=payload)
-        if r.status_code < 200 or r.status_code >= 300:
-            raise HTTPException(502, f"gptunnel create {r.status_code}: {(r.text or '')[:1200]}")
-        data = r.json()
-
+async def _media_create(payload: Dict[str, Any], client: httpx.AsyncClient) -> Dict[str, Any]:
+    r = await client.post(GPTUNNEL_CREATE_URL, headers=_auth_headers(), json=payload)
+    if r.status_code < 200 or r.status_code >= 300:
+        raise HTTPException(502, f"gptunnel create {r.status_code}: {(r.text or '')[:1200]}")
+    data = r.json()
     if not isinstance(data, dict) or not data.get("id"):
         raise HTTPException(502, f"unexpected create response: {str(data)[:1200]}")
     return data
 
 
-async def _media_result(task_id: str) -> Dict[str, Any]:
-    payload = {"task_id": task_id}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(GPTUNNEL_RESULT_URL, headers=_auth_headers(), json=payload)
-        if r.status_code < 200 or r.status_code >= 300:
-            raise HTTPException(502, f"gptunnel result {r.status_code}: {(r.text or '')[:1200]}")
-        data = r.json()
-
+async def _media_result(task_id: str, client: httpx.AsyncClient) -> Dict[str, Any]:
+    r = await client.post(GPTUNNEL_RESULT_URL, headers=_auth_headers(), json={"task_id": task_id})
+    if r.status_code < 200 or r.status_code >= 300:
+        raise HTTPException(502, f"gptunnel result {r.status_code}: {(r.text or '')[:1200]}")
+    data = r.json()
     if not isinstance(data, dict) or not data.get("id"):
         raise HTTPException(502, f"unexpected result response: {str(data)[:1200]}")
     return data
 
 
-async def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float) -> Dict[str, Any]:
+async def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float, client: httpx.AsyncClient) -> Dict[str, Any]:
     t0 = time.time()
     last: Optional[Dict[str, Any]] = None
 
     while True:
-        last = await _media_result(task_id)
+        last = await _media_result(task_id, client)
         status = str(last.get("status") or "").lower()
 
-        # серверный лог
+        # Логи на сервер (полезно)
         print("tryon poll:", {"id": task_id, "status": status})
 
         if status == "done":
             return last
-
         if status in ("error", "failed"):
             raise HTTPException(502, f"tryon failed status={status}: {str(last)[:1200]}")
 
@@ -539,17 +483,6 @@ async def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float) ->
         await asyncio.sleep(interval_sec)
 
 
-def _sniff_mime(b: bytes) -> str:
-    # минимальная сигнатура: png/webp/jpeg
-    if b.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if b.startswith(b"RIFF") and b[8:12] == b"WEBP":
-        return "image/webp"
-    if b.startswith(b"\xff\xd8"):
-        return "image/jpeg"
-    return "application/octet-stream"
-
-
 @app.post("/tryon/outfit")
 async def tryon_outfit(
     # вещи
@@ -557,14 +490,14 @@ async def tryon_outfit(
     bottom: UploadFile = File(...),
     shoes: Optional[UploadFile] = File(None),
     outer: Optional[UploadFile] = File(None),
-    # человек (база)
+    # человек (БАЗА)
     person_front: UploadFile = File(...),
-    # опционально
+
     prompt_extra: Optional[str] = None,
-    model: Optional[str] = None,   # ?model=nano-banana
-    ar: Optional[str] = None,      # ?ar=3:4 (если хочешь руками)
+    model: Optional[str] = None,
+    ar: Optional[str] = Query(default=None, description="1:1|16:9|9:16|4:3|3:4"),
 ):
-    # 1) read
+    # -------- read inputs
     t_bytes = await top.read()
     b_bytes = await bottom.read()
     s_bytes = await shoes.read() if shoes else None
@@ -578,55 +511,75 @@ async def tryon_outfit(
     if not p_bytes:
         raise HTTPException(400, "person_front is empty")
 
-    # 2) open
+    # -------- decode images
     top_img = _open_image(t_bytes)
     bottom_img = _open_image(b_bytes)
+    person_img = _open_image(p_bytes)
     shoes_img = _open_image(s_bytes) if (s_bytes and len(s_bytes) > 0) else None
     outer_img = _open_image(o_bytes) if (o_bytes and len(o_bytes) > 0) else None
-    person_img = _open_image(p_bytes)
 
-    # 3) ar: авто от человека, если не задан
-    use_ar: Optional[str] = None
-    if ar:
-        ar = ar.strip()
-        if ar in ALLOWED_AR:
-            use_ar = ar
-    if not use_ar:
-        use_ar = _choose_ar_from_base(person_img)
+    # -------- ar
+    auto_ar = _pick_ar_from_size(*person_img.size)
+    use_ar = (ar or auto_ar).strip()
+    if use_ar not in ALLOWED_AR:
+        raise HTTPException(400, f"ar must be one of {ALLOWED_AR}, got {use_ar}")
 
-    # 4) encode images
-    # TOP: PNG + композит с увеличением принта (самое важное!)
-    top_ref = _make_top_composite_with_print_zoom(top_img)
-    top_url = _data_url("image/png", _to_png_bytes(top_ref, max_side=1600))
+    # -------- encode with DIFFERENT quality
+    # PRINT_CROP: максимум качества
+    print_crop = _make_center_crop(top_img, crop_w=0.55, crop_h=0.55)
+    print_crop = _resize_max(print_crop, 1200)
+    print_crop_jpeg = _encode_jpeg(print_crop, quality=92)
 
-    # Остальные можно JPEG (экономим размер JSON), но не убиваем качество слишком сильно
-    bottom_url = _data_url("image/jpeg", _to_jpeg_bytes(bottom_img, max_side=1100, quality=82))
+    # TOP_FULL: высокое качество
+    top_full = _resize_max(top_img, 1600)
+    top_full_jpeg = _encode_jpeg(top_full, quality=90)
 
-    images: List[str] = [top_url, bottom_url]
+    # остальное можно пожать сильнее
+    bottom_jpeg = _encode_jpeg(_resize_max(bottom_img, 1100), quality=82)
+    person_jpeg = _encode_jpeg(_resize_max(person_img, 1300), quality=84)
+
+    images: List[str] = []
+    images.append(_to_data_url_jpeg(print_crop_jpeg))   # Image 1 PRINT_CROP (эталон принта)
+    images.append(_to_data_url_jpeg(top_full_jpeg))     # Image 2 TOP_FULL
+    images.append(_to_data_url_jpeg(bottom_jpeg))       # Image 3 BOTTOM
 
     if shoes_img is not None:
-        images.append(_data_url("image/jpeg", _to_jpeg_bytes(shoes_img, max_side=1100, quality=82)))
+        shoes_jpeg = _encode_jpeg(_resize_max(shoes_img, 1000), quality=80)
+        images.append(_to_data_url_jpeg(shoes_jpeg))    # Image 4 SHOES
     if outer_img is not None:
-        images.append(_data_url("image/jpeg", _to_jpeg_bytes(outer_img, max_side=1100, quality=82)))
+        outer_jpeg = _encode_jpeg(_resize_max(outer_img, 1200), quality=82)
+        images.append(_to_data_url_jpeg(outer_jpeg))    # Image 5 OUTER
 
-    # ЧЕЛОВЕК — ПОСЛЕДНИМ (как у тебя стабильно работало)
-    images.append(_data_url("image/jpeg", _to_jpeg_bytes(person_img, max_side=1100, quality=82)))
+    # КЛЮЧЕВО: человек всегда последним
+    images.append(_to_data_url_jpeg(person_jpeg))       # LAST = PERSON_BASE
 
-    # 5) prompt
+    # -------- prompt
     prompt = TRYON_OUTFIT_PROMPT
     if prompt_extra and prompt_extra.strip():
         prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
 
     use_model = (model or TRYON_MODEL_DEFAULT).strip()
 
-    # 6) create -> wait -> fetch
-    created = await _media_create(prompt=prompt, images=images, model=use_model, ar=use_ar)
-    task_id = created["id"]
+    payload: Dict[str, Any] = {
+        "model": use_model,
+        "prompt": prompt,
+        "images": images,
+        "ar": use_ar,
+    }
 
-    done = await _wait_for_done(task_id, TRYON_POLL_TIMEOUT_SEC, TRYON_POLL_INTERVAL_SEC)
-    url = done.get("url")
-    if not url:
-        raise HTTPException(502, f"tryon done but url is null: {done}")
+    # -------- call gptunnel
+    timeout = httpx.Timeout(connect=30.0, read=180.0, write=60.0, pool=60.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        created = await _media_create(payload, client)
+        task_id = created["id"]
 
-    out_bytes = await _fetch_image_bytes(str(url))
-    return Response(content=out_bytes, media_type=_sniff_mime(out_bytes))
+        done = await _wait_for_done(task_id, TRYON_POLL_TIMEOUT_SEC, TRYON_POLL_INTERVAL_SEC, client)
+
+        url = done.get("url")
+        if not url:
+            raise HTTPException(502, f"tryon done but url is null: {done}")
+
+        out_bytes = await _fetch_image_bytes(str(url), client)
+
+    # обычно webp/png — но клиенту ок отдавать как image/png, браузер откроет
+    return Response(content=out_bytes, media_type="image/png")
