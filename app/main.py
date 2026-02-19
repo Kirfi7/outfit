@@ -281,10 +281,10 @@ import os
 import time
 import base64
 from io import BytesIO
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import requests
-from fastapi import UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response
 from PIL import Image
 
@@ -296,60 +296,66 @@ except Exception:
     pillow_heif = None
 
 
-# ============ GPTUNNEL CreativeLab config ============
+# ================== CONFIG ==================
+app = FastAPI()
+
 GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY", "shds-StExbfcU2hbeyQoB1v3CGa229aV")
 if not GPTUNNEL_KEY:
-    raise RuntimeError("GPTUNNEL_KEY (или AITUNNEL_KEY) env var is not set")
+    raise RuntimeError("GPTUNNEL_KEY env var is not set")
 
-GPTUNNEL_BASE = os.getenv("GPTUNNEL_BASE_URL", "https://gptunnel.ru")
+GPTUNNEL_BASE = os.getenv("GPTUNNEL_BASE_URL", "https://gptunnel.ru").rstrip("/")
 GPTUNNEL_CREATE_URL = f"{GPTUNNEL_BASE}/v1/media/create"
 GPTUNNEL_RESULT_URL = f"{GPTUNNEL_BASE}/v1/media/result"
 
-# Модель примерки (как ты хочешь)
-TRYON_MODEL = os.getenv("TRYON_MODEL", "nano-banana")
+TRYON_MODEL_DEFAULT = os.getenv("TRYON_MODEL", "nano-banana")
 
-# Тайминги поллинга
 TRYON_POLL_TIMEOUT_SEC = int(os.getenv("TRYON_POLL_TIMEOUT_SEC", "180"))
 TRYON_POLL_INTERVAL_SEC = float(os.getenv("TRYON_POLL_INTERVAL_SEC", "1.2"))
 
-# Соотношение сторон (по докам именно ar, не size)
-# TRYON_AR = os.getenv("TRYON_AR", "1:1")  # '1:1', '16:9', '9:16', '4:3', '3:4'
+# Для full-body чаще всего лучше 3:4 или 9:16. Можно передать параметром ar=...
+TRYON_AR_DEFAULT = os.getenv("TRYON_AR", "3:4")
 
 
-TRYON_OUTFIT_PROMPT = """
+# ================== PROMPT (base) ==================
+PROMPT_BASE = """
 ЗАДАЧА: ФОТО-РЕДАКТИРОВАНИЕ (НЕ генерация новой сцены).
-Используй Image 1 как базовый кадр. Итог должен выглядеть как то же самое фото, но человек одет в вещи-референсы.
+Итог должен выглядеть как ТО ЖЕ САМОЕ фото базового человека, но он одет в вещи-референсы.
 
-ВХОД:
-Image 1 = человек (база). Это фото нельзя менять по смыслу: тот же человек, тот же фон, тот же ракурс.
-Image 2 = верх (top) — каталожное фото вещи.
-Image 3 = низ (bottom) — каталожное фото вещи.
-Image 4 = обувь (shoes) — если есть.
-Image 5 = верхняя одежда (outer) — если есть.
+КРИТИЧНО:
+- Базовое фото человека указано в последнем изображении (последний Image).
+- Нельзя менять личность человека и фон.
 
 РАЗРЕШЕНО ИЗМЕНИТЬ ТОЛЬКО:
-- одежду на человеке (верх/низ/обувь/верхняя одежда) так, чтобы она выглядела надетой реалистично.
+- одежду на человеке (верх/низ/обувь/верхняя одежда), чтобы она выглядела надетой реалистично.
 
 ЗАПРЕЩЕНО МЕНЯТЬ (КРИТИЧНО):
 - лицо, черты лица, прическу, бороду/усы, возраст, пол, этничность
 - телосложение, рост, пропорции, позу, положение рук/ног
-- фон, помещение, мебель, стены, светильники, перспективу, ракурс камеры
+- фон/помещение/мебель/стены/свет/перспективу/ракурс камеры
 - кадрирование/масштаб (не приближать/не отдалять, не переносить человека в другую комнату)
 - НЕ добавлять других людей, манекены, лишние предметы
 
 КАК СДЕЛАТЬ:
-- Перенеси дизайн/цвет/материал/крой вещей из Image 2..5 на человека из Image 1.
-- Сохрани естественные складки, натяжение ткани, тени и освещение, соответствующее Image 1.
+- Перенеси дизайн/цвет/материал/крой вещей с референсов на человека.
+- Сохрани естественные складки, натяжение ткани, тени и освещение, соответствующее базовому фото.
 - Логотипы/принты переносить корректно и читаемо (если есть).
-- Если Image 4 или Image 5 не переданы — НЕ добавляй обувь/куртку “из головы”.
 
-ОТРИЦАТЕЛЬНЫЕ УКАЗАНИЯ (anti):
-не менять лицо, не менять фон, не менять пол/возраст, не студийная пересъёмка, не новый человек,
-не два человека, не женское тело вместо мужского, не “фото из офиса по умолчанию”, не “девушка-модель”.
+ANTI (строго):
+не новый человек, не студийная пересъёмка, не “офис по умолчанию”, не менять лицо, не менять фон,
+не два человека, не женское тело вместо мужского, не менять возраст/пол.
 
 ВЫХОД:
 Одно итоговое фотореалистичное изображение.
 """.strip()
+
+
+# ================== HELPERS ==================
+def _auth_headers() -> Dict[str, str]:
+    # По докам: Authorization: YOUR_API_KEY (без Bearer)
+    return {
+        "Authorization": GPTUNNEL_KEY,
+        "Content-Type": "application/json",
+    }
 
 
 def _normalize_to_jpeg(image_bytes: bytes, max_side: int = 1280, quality: int = 82) -> bytes:
@@ -390,19 +396,10 @@ def _to_data_url_jpeg(jpeg_bytes: bytes) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 
-def _auth_headers() -> Dict[str, str]:
-    # По докам gptunnel: Authorization: YOUR_API_KEY (без Bearer)
-    return {
-        "Authorization": GPTUNNEL_KEY,
-        "Content-Type": "application/json",
-    }
-
-
 def _decode_data_url_image(url: str) -> Optional[bytes]:
     url = (url or "").strip()
     if not url.startswith("data:"):
         return None
-    # data:image/png;base64,AAAA
     try:
         b64_part = url.split(",", 1)[1]
         return base64.b64decode(b64_part)
@@ -416,7 +413,7 @@ def _fetch_image_bytes(url: str) -> bytes:
     if maybe:
         return maybe
 
-    # 2) обычная ссылка
+    # 2) http(s)
     try:
         r = requests.get(url, timeout=180)
     except Exception as e:
@@ -427,13 +424,25 @@ def _fetch_image_bytes(url: str) -> bytes:
     return r.content
 
 
-def _media_create(prompt: str, images: List[str], model: str) -> Dict[str, Any]:
+def _sniff_media_type(b: bytes) -> str:
+    if b.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if b.startswith(b"RIFF") and b[8:12] == b"WEBP":
+        return "image/webp"
+    if b.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    return "application/octet-stream"
+
+
+def _media_create(prompt: str, images: List[str], model: str, ar: Optional[str] = None) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model": model,
         "prompt": prompt,
         "images": images,  # Array<string> links; data-url тоже "link"
-        # "ar": ar,
     }
+    if ar:
+        payload["ar"] = ar
+
     try:
         r = requests.post(GPTUNNEL_CREATE_URL, headers=_auth_headers(), json=payload, timeout=120)
     except Exception as e:
@@ -443,7 +452,6 @@ def _media_create(prompt: str, images: List[str], model: str) -> Dict[str, Any]:
         raise HTTPException(502, f"gptunnel create {r.status_code}: {(r.text or '')[:1200]}")
 
     data = r.json()
-    # ожидаем { code: 0, id: "...", status: "idle", ... }
     if not isinstance(data, dict) or not data.get("id"):
         raise HTTPException(502, f"unexpected create response: {str(data)[:1200]}")
     return data
@@ -467,7 +475,8 @@ def _media_result(task_id: str) -> Dict[str, Any]:
 
 def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float) -> Dict[str, Any]:
     t0 = time.time()
-    last = None
+    last: Optional[Dict[str, Any]] = None
+
     while True:
         last = _media_result(task_id)
         status = (last.get("status") or "").lower()
@@ -475,7 +484,6 @@ def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float) -> Dict[
         if status == "done":
             return last
 
-        # иногда может быть "error"/"failed" — на всякий
         if status in ("error", "failed"):
             raise HTTPException(502, f"tryon failed status={status}: {str(last)[:1200]}")
 
@@ -485,10 +493,68 @@ def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float) -> Dict[
         time.sleep(interval_sec)
 
 
-# ------------------ ENDPOINT ------------------
-# ВАЖНО: этот декоратор должен быть в том же файле, где твой app = FastAPI()
-# app.post("/tryon/outfit") ниже — просто вставь как есть (или поправь под свой app)
+def _build_images_and_prompt(
+    person_front_jpeg: bytes,
+    top_jpeg: bytes,
+    bottom_jpeg: bytes,
+    shoes_jpeg: Optional[bytes],
+    outer_jpeg: Optional[bytes],
+    prompt_extra: Optional[str],
+) -> Tuple[List[str], str]:
+    """
+    Порядок как у тебя «работало»:
+    Image 1: top
+    Image 2: bottom
+    Image 3: shoes (optional)
+    Image 4: outer (optional)
+    Image N: person (base)  <-- ВСЕГДА ПОСЛЕДНИЙ
+    """
+    images: List[str] = []
+    labels: List[str] = []
 
+    # 1) top, 2) bottom
+    images.append(_to_data_url_jpeg(top_jpeg))
+    labels.append("верх (top) — каталожное фото вещи")
+
+    images.append(_to_data_url_jpeg(bottom_jpeg))
+    labels.append("низ (bottom) — каталожное фото вещи")
+
+    # optional shoes
+    if shoes_jpeg:
+        images.append(_to_data_url_jpeg(shoes_jpeg))
+        labels.append("обувь (shoes) — каталожное фото")
+
+    # optional outer
+    if outer_jpeg:
+        images.append(_to_data_url_jpeg(outer_jpeg))
+        labels.append("верхняя одежда (outer) — каталожное фото")
+
+    # person ALWAYS LAST
+    images.append(_to_data_url_jpeg(person_front_jpeg))
+    labels.append("человек (БАЗА). Это фото нельзя менять: личность/фон/ракурс/поза")
+
+    # numbered list
+    numbered = "\n".join([f"- Image {i+1}: {labels[i]}" for i in range(len(labels))])
+
+    prompt = f"""
+{PROMPT_BASE}
+
+ВХОДНЫЕ ИЗОБРАЖЕНИЯ (ПОРЯДОК ВАЖЕН):
+{numbered}
+
+КРИТИЧНО:
+- Базовый человек — это ПОСЛЕДНИЙ Image {len(labels)}.
+- Вещи-референсы — это Image 1..{len(labels)-1}.
+- Нельзя генерировать нового человека или новую сцену. Только «переодеть» базового.
+""".strip()
+
+    if prompt_extra and prompt_extra.strip():
+        prompt += "\n\nДОП. ТРЕБОВАНИЯ ОТ ПОЛЬЗОВАТЕЛЯ:\n" + prompt_extra.strip()
+
+    return images, prompt
+
+
+# ================== ENDPOINT ==================
 @app.post("/tryon/outfit")
 async def tryon_outfit(
     person_front: UploadFile = File(...),
@@ -498,9 +564,9 @@ async def tryon_outfit(
     outer: Optional[UploadFile] = File(None),
     prompt_extra: Optional[str] = None,
     model: Optional[str] = None,   # можно передавать ?model=nano-banana
-    # ar: Optional[str] = None,      # можно передавать ?ar=3:4
+    ar: Optional[str] = None,      # можно передавать ?ar=3:4 или ?ar=9:16
 ):
-    # 1) read inputs
+    # read inputs
     p_bytes = await person_front.read()
     t_bytes = await top.read()
     b_bytes = await bottom.read()
@@ -515,38 +581,48 @@ async def tryon_outfit(
     s_bytes = await shoes.read() if shoes else None
     o_bytes = await outer.read() if outer else None
 
-    # 2) normalize -> jpeg
-    images: List[str] = []
-    images.append(_to_data_url_jpeg(_normalize_to_jpeg(p_bytes, 1280, 82)))
-    images.append(_to_data_url_jpeg(_normalize_to_jpeg(t_bytes, 1280, 82)))
-    images.append(_to_data_url_jpeg(_normalize_to_jpeg(b_bytes, 1280, 82)))
+    # normalize -> jpeg bytes
+    # person можно чуть крупнее по стороне, но оставим одинаково
+    person_jpeg = _normalize_to_jpeg(p_bytes, max_side=1280, quality=82)
+    top_jpeg = _normalize_to_jpeg(t_bytes, max_side=1280, quality=82)
+    bottom_jpeg = _normalize_to_jpeg(b_bytes, max_side=1280, quality=82)
+    shoes_jpeg = _normalize_to_jpeg(s_bytes, max_side=1280, quality=82) if s_bytes else None
+    outer_jpeg = _normalize_to_jpeg(o_bytes, max_side=1280, quality=82) if o_bytes else None
 
-    if s_bytes:
-        images.append(_to_data_url_jpeg(_normalize_to_jpeg(s_bytes, 1280, 82)))
-    if o_bytes:
-        images.append(_to_data_url_jpeg(_normalize_to_jpeg(o_bytes, 1280, 82)))
+    images, prompt = _build_images_and_prompt(
+        person_front_jpeg=person_jpeg,
+        top_jpeg=top_jpeg,
+        bottom_jpeg=bottom_jpeg,
+        shoes_jpeg=shoes_jpeg,
+        outer_jpeg=outer_jpeg,
+        prompt_extra=prompt_extra,
+    )
 
-    # 3) prompt
-    prompt = TRYON_OUTFIT_PROMPT
-    if prompt_extra and prompt_extra.strip():
-        prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
+    use_model = (model or TRYON_MODEL_DEFAULT).strip()
+    use_ar = (ar or TRYON_AR_DEFAULT).strip() if (ar or TRYON_AR_DEFAULT) else None
 
-    use_model = (model or TRYON_MODEL).strip()
-    # use_ar = (ar or TRYON_AR).strip()
+    # debug (без утечек base64)
+    print(
+        {
+            "tryon_model": use_model,
+            "ar": use_ar,
+            "num_images": len(images),
+            "image_lengths": [len(x) for x in images],
+            "person_is_last": True,
+        }
+    )
 
-    # 4) create task
-    created = _media_create(prompt=prompt, images=images, model=use_model)
+    # create task
+    created = _media_create(prompt=prompt, images=images, model=use_model, ar=use_ar)
     task_id = created["id"]
 
-    # 5) wait result
+    # wait result
     done = _wait_for_done(task_id, TRYON_POLL_TIMEOUT_SEC, TRYON_POLL_INTERVAL_SEC)
     url = done.get("url")
     if not url:
         raise HTTPException(502, f"tryon done but url is null: {str(done)[:1200]}")
 
-    # 6) fetch image bytes
     out_bytes = _fetch_image_bytes(str(url))
+    media_type = _sniff_media_type(out_bytes) or "image/png"
 
-    # content-type: часто webp/png; но мы просто отдаём как image/*
-    # если хочешь строго — можно определить по сигнатуре.
-    return Response(content=out_bytes, media_type="image/png")
+    return Response(content=out_bytes, media_type=media_type)
