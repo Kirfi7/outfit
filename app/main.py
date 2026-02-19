@@ -282,25 +282,22 @@ import time
 import base64
 import asyncio
 from io import BytesIO
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response
 from PIL import Image
 
-# HEIC support (optional)
 try:
     import pillow_heif  # type: ignore
     pillow_heif.register_heif_opener()
 except Exception:
     pillow_heif = None
 
-
 app = FastAPI()
 
-# ============ GPTUNNEL CreativeLab config ============
-GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY", "shds-StExbfcU2hbeyQoB1v3CGa229aV")
+GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY", "")
 if not GPTUNNEL_KEY:
     raise RuntimeError("GPTUNNEL_KEY env var is not set")
 
@@ -309,58 +306,50 @@ GPTUNNEL_CREATE_URL = f"{GPTUNNEL_BASE}/v1/media/create"
 GPTUNNEL_RESULT_URL = f"{GPTUNNEL_BASE}/v1/media/result"
 
 TRYON_MODEL_DEFAULT = os.getenv("TRYON_MODEL", "nano-banana")
-
-TRYON_POLL_TIMEOUT_SEC = int(os.getenv("TRYON_POLL_TIMEOUT_SEC", "600"))   # было 180 — мало
+TRYON_POLL_TIMEOUT_SEC = int(os.getenv("TRYON_POLL_TIMEOUT_SEC", "600"))
 TRYON_POLL_INTERVAL_SEC = float(os.getenv("TRYON_POLL_INTERVAL_SEC", "1.2"))
-
-# Если доки требуют ar — можно включить параметром, но не обязательно.
-# TRYON_AR_DEFAULT = os.getenv("TRYON_AR", "3:4")
 
 TRYON_OUTFIT_PROMPT = """
 ЗАДАЧА: ФОТО-РЕДАКТИРОВАНИЕ (НЕ генерация новой сцены).
-Используй фото человека как базу и измени ТОЛЬКО одежду.
+Используй базовое фото человека и измени ТОЛЬКО одежду.
 
-ВАЖНО ПРО ПОРЯДОК:
-- Последнее изображение (последний Image) — это БАЗОВОЕ фото ЧЕЛОВЕКА.
-- Остальные изображения — референсы ВЕЩЕЙ.
+ПОРЯДОК ВХОДА (КРИТИЧНО):
+- Последнее изображение (последний Image) — БАЗОВОЕ фото ЧЕЛОВЕКА.
+- Остальные изображения до него — РЕФЕРЕНСЫ ВЕЩЕЙ.
 
 ВХОД:
-- Image: верх (top)
-- Image: низ (bottom)
-- Image: обувь (shoes), если есть
-- Image: верхняя одежда (outer), если есть
-- Image: человек (вид спереди) — БАЗА (ПОСЛЕДНИЙ Image)
+Image 1: верх (top) — каталожное фото футболки/верха. ЭТО АВТОРИТЕТНЫЙ ИСТОЧНИК ПРИНТА/ЛОГО/ТЕКСТА.
+Image 2: низ (bottom)
+Image 3: обувь (shoes), если есть
+Image 4: верхняя одежда (outer), если есть
+Image 5: человек (base) — ПОСЛЕДНИЙ image
 
 РАЗРЕШЕНО ИЗМЕНИТЬ ТОЛЬКО:
-- одежду на человеке. Всё остальное оставить как есть.
+- одежду на человеке (верх/низ/обувь/outer)
 
-ЗАПРЕЩЕНО (КРИТИЧНО):
+ЗАПРЕЩЕНО:
 - менять лицо/личность/пол/возраст/телосложение/позу
-- менять фон/помещение/свет/перспективу/ракурс/кадрирование
-- добавлять других людей или предметы
+- менять фон/свет/перспективу/ракурс/кадрирование
+- добавлять других людей/манекены/предметы
 
-СДЕЛАЙ:
-- перенеси дизайн/цвет/материал/крой вещей с референсов на человека
-- реалистичная посадка, складки, тени и освещение как на базовом фото
+КРИТИЧНО ПРО ВЕРХ (футболку):
+- принт/надписи/логотипы должны совпадать с Image 1 (top) максимально точно
+- НЕ упрощать принт, НЕ заменять на другой, НЕ рисовать "похожий"
+- если принт на Image 1 виден плохо — всё равно НЕ выдумывать новый, лучше оставить максимально близко как на Image 1
 
 ВЫХОД:
-одно фотореалистичное итоговое изображение
+одно фотореалистичное изображение.
 """.strip()
 
 
 def _auth_headers() -> Dict[str, str]:
-    # по докам: Authorization: KEY (без Bearer)
     return {
-        "Authorization": GPTUNNEL_KEY,
+        "Authorization": GPTUNNEL_KEY,  # без Bearer
         "Content-Type": "application/json",
     }
 
 
-def _normalize_to_jpeg(image_bytes: bytes, max_side: int = 900, quality: int = 72) -> bytes:
-    """
-    Сильно важно ужимать, чтобы JSON не становился гигантским.
-    max_side=900/quality=72 обычно достаточно для try-on.
-    """
+def _open_image(image_bytes: bytes) -> Image.Image:
     try:
         img = Image.open(BytesIO(image_bytes))
     except Exception as e:
@@ -375,23 +364,39 @@ def _normalize_to_jpeg(image_bytes: bytes, max_side: int = 900, quality: int = 7
     except Exception:
         pass
 
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+    return img
 
+
+def _resize(img: Image.Image, max_side: int) -> Image.Image:
     w, h = img.size
     m = max(w, h)
-    if m > max_side:
-        scale = max_side / float(m)
-        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+    if m <= max_side:
+        return img
+    scale = max_side / float(m)
+    return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
 
+
+def _to_jpeg_bytes(img: Image.Image, max_side: int, quality: int) -> bytes:
+    img = _resize(img, max_side)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     out = BytesIO()
     img.save(out, format="JPEG", quality=quality, optimize=True)
     return out.getvalue()
 
 
-def _to_data_url_jpeg(jpeg_bytes: bytes) -> str:
-    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
+def _to_png_bytes(img: Image.Image, max_side: int) -> bytes:
+    img = _resize(img, max_side)
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA")
+    out = BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
+def _to_data_url(data: bytes, mime: str) -> str:
+    b64 = base64.b64encode(data).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
 
 
 def _decode_data_url_image(url: str) -> Optional[bytes]:
@@ -399,8 +404,7 @@ def _decode_data_url_image(url: str) -> Optional[bytes]:
     if not url.startswith("data:"):
         return None
     try:
-        b64_part = url.split(",", 1)[1]
-        return base64.b64decode(b64_part)
+        return base64.b64decode(url.split(",", 1)[1])
     except Exception:
         return None
 
@@ -409,7 +413,6 @@ async def _fetch_image_bytes(url: str) -> bytes:
     maybe = _decode_data_url_image(url)
     if maybe:
         return maybe
-
     async with httpx.AsyncClient(timeout=180) as client:
         r = await client.get(url)
         if r.status_code < 200 or r.status_code >= 300:
@@ -418,19 +421,12 @@ async def _fetch_image_bytes(url: str) -> bytes:
 
 
 async def _media_create(prompt: str, images: List[str], model: str) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        "images": images,
-        # "ar": ar,  # если нужно по докам — добавишь параметром
-    }
-
+    payload: Dict[str, Any] = {"model": model, "prompt": prompt, "images": images}
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(GPTUNNEL_CREATE_URL, headers=_auth_headers(), json=payload)
         if r.status_code < 200 or r.status_code >= 300:
             raise HTTPException(502, f"gptunnel create {r.status_code}: {(r.text or '')[:1200]}")
         data = r.json()
-
     if not isinstance(data, dict) or not data.get("id"):
         raise HTTPException(502, f"unexpected create response: {str(data)[:1200]}")
     return data
@@ -443,7 +439,6 @@ async def _media_result(task_id: str) -> Dict[str, Any]:
         if r.status_code < 200 or r.status_code >= 300:
             raise HTTPException(502, f"gptunnel result {r.status_code}: {(r.text or '')[:1200]}")
         data = r.json()
-
     if not isinstance(data, dict) or not data.get("id"):
         raise HTTPException(502, f"unexpected result response: {str(data)[:1200]}")
     return data
@@ -452,22 +447,16 @@ async def _media_result(task_id: str) -> Dict[str, Any]:
 async def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float) -> Dict[str, Any]:
     t0 = time.time()
     last: Optional[Dict[str, Any]] = None
-
     while True:
         last = await _media_result(task_id)
         status = str(last.get("status") or "").lower()
-
-        # полезно логировать на сервере
         print("tryon poll:", {"id": task_id, "status": status})
 
         if status == "done":
             return last
-
         if status in ("error", "failed"):
             raise HTTPException(502, f"tryon failed status={status}: {str(last)[:1200]}")
-
         if time.time() - t0 > timeout_sec:
-            # ВАЖНО: возвращаем last полностью, чтобы видеть status и причину
             raise HTTPException(504, f"tryon timeout after {timeout_sec}s: {last}")
 
         await asyncio.sleep(interval_sec)
@@ -475,19 +464,14 @@ async def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float) ->
 
 @app.post("/tryon/outfit")
 async def tryon_outfit(
-    # вещи
     top: UploadFile = File(...),
     bottom: UploadFile = File(...),
     shoes: Optional[UploadFile] = File(None),
     outer: Optional[UploadFile] = File(None),
-    # человек
     person_front: UploadFile = File(...),
-
     prompt_extra: Optional[str] = None,
-    model: Optional[str] = None,   # ?model=nano-banana
-    # ar: Optional[str] = None,     # ?ar=3:4 если нужно
+    model: Optional[str] = None,
 ):
-    # читаем
     t_bytes = await top.read()
     b_bytes = await bottom.read()
     s_bytes = await shoes.read() if shoes else None
@@ -501,18 +485,33 @@ async def tryon_outfit(
     if not p_bytes:
         raise HTTPException(400, "person_front is empty")
 
-    # нормализация (сжатие!)
+    # --- decode images ---
+    top_img = _open_image(t_bytes)
+    bottom_img = _open_image(b_bytes)
+    person_img = _open_image(p_bytes)
+
+    shoes_img = _open_image(s_bytes) if (s_bytes and len(s_bytes) > 0) else None
+    outer_img = _open_image(o_bytes) if (o_bytes and len(o_bytes) > 0) else None
+
+    # --- IMPORTANT: keep TOP high fidelity (PNG, bigger) ---
+    top_png = _to_png_bytes(top_img, max_side=1400)   # принт не разваливается
+    bottom_jpg = _to_jpeg_bytes(bottom_img, max_side=1100, quality=84)
+    person_jpg = _to_jpeg_bytes(person_img, max_side=900, quality=72)
+
     images: List[str] = []
-    images.append(_to_data_url_jpeg(_normalize_to_jpeg(t_bytes)))
-    images.append(_to_data_url_jpeg(_normalize_to_jpeg(b_bytes)))
+    images.append(_to_data_url(top_png, "image/png"))                 # top
+    images.append(_to_data_url(bottom_jpg, "image/jpeg"))             # bottom
 
-    if s_bytes and len(s_bytes) > 0:
-        images.append(_to_data_url_jpeg(_normalize_to_jpeg(s_bytes)))
-    if o_bytes and len(o_bytes) > 0:
-        images.append(_to_data_url_jpeg(_normalize_to_jpeg(o_bytes)))
+    if shoes_img is not None:
+        shoes_jpg = _to_jpeg_bytes(shoes_img, max_side=1100, quality=84)
+        images.append(_to_data_url(shoes_jpg, "image/jpeg"))
 
-    # КЛЮЧЕВО: человек — ПОСЛЕДНИМ (как у тебя работало в ручном тесте)
-    images.append(_to_data_url_jpeg(_normalize_to_jpeg(p_bytes)))
+    if outer_img is not None:
+        outer_jpg = _to_jpeg_bytes(outer_img, max_side=1100, quality=84)
+        images.append(_to_data_url(outer_jpg, "image/jpeg"))
+
+    # человек — СТРОГО последним (как у тебя “вручную” работало)
+    images.append(_to_data_url(person_jpg, "image/jpeg"))
 
     prompt = TRYON_OUTFIT_PROMPT
     if prompt_extra and prompt_extra.strip():
@@ -524,7 +523,6 @@ async def tryon_outfit(
     task_id = created["id"]
 
     done = await _wait_for_done(task_id, TRYON_POLL_TIMEOUT_SEC, TRYON_POLL_INTERVAL_SEC)
-
     url = done.get("url")
     if not url:
         raise HTTPException(502, f"tryon done but url is null: {done}")
