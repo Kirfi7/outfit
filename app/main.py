@@ -298,7 +298,7 @@ except Exception:
 app = FastAPI()
 
 # ================== HARD-CODED CONFIG (for local test) ==================
-GEMINI_API_KEY = "AIzaSyAq09NEzkyit2K-bsKPDjG1bLJSmv1GQOg"
+
 GEMINI_MODEL = "gemini-2.5-flash-image"
 
 # Прокси: обычно схема http:// даже если тип "HTTPS" (это про CONNECT-туннель)
