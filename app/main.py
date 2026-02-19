@@ -277,15 +277,14 @@ app = FastAPI()
 #
 #     return ShoesOut(**out)
 
-import os
-import time
+
+
 import base64
-import asyncio
 from io import BytesIO
 from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response
 from PIL import Image
 
@@ -296,51 +295,50 @@ try:
 except Exception:
     pillow_heif = None
 
-
 app = FastAPI()
 
-# ============ GPTUNNEL CreativeLab config ============
-GPTUNNEL_KEY = os.getenv("GPTUNNEL_KEY", "shds-StExbfcU2hbeyQoB1v3CGa229aV")
-if not GPTUNNEL_KEY:
-    raise RuntimeError("GPTUNNEL_KEY env var is not set")
+# ================== HARD-CODED CONFIG (for local test) ==================
+GEMINI_API_KEY = "AIzaSyAq09NEzkyit2K-bsKPDjG1bLJSmv1GQOg"
+GEMINI_MODEL = "gemini-2.5-flash-image"
 
-GPTUNNEL_BASE = os.getenv("GPTUNNEL_BASE_URL", "https://gptunnel.ru").rstrip("/")
-GPTUNNEL_CREATE_URL = f"{GPTUNNEL_BASE}/v1/media/create"
-GPTUNNEL_RESULT_URL = f"{GPTUNNEL_BASE}/v1/media/result"
+# Прокси: обычно схема http:// даже если тип "HTTPS" (это про CONNECT-туннель)
+# ВСТАВЬ СВОИ LOGIN/PASSWORD/IP/PORT
+PROXY_URL = "http://sve2Zh:1W4P9D@138.219.173.226:8000"
+# Например: "http://sve2Zh:1W4P9D@138.219.173.226:8000"
+# =======================================================================
 
-TRYON_MODEL_DEFAULT = os.getenv("TRYON_MODEL", "nano-banana")
+if not GEMINI_API_KEY or "PASTE_" in GEMINI_API_KEY:
+    raise RuntimeError("Set GEMINI_API_KEY in code for local test")
+if not PROXY_URL or "LOGIN" in PROXY_URL:
+    # если хочешь тест без прокси — поставь PROXY_URL = ""
+    pass
 
-TRYON_POLL_TIMEOUT_SEC = int(os.getenv("TRYON_POLL_TIMEOUT_SEC", "600"))
-TRYON_POLL_INTERVAL_SEC = float(os.getenv("TRYON_POLL_INTERVAL_SEC", "1.2"))
 
-ALLOWED_AR = ["1:1", "16:9", "9:16", "4:3", "3:4"]
-
-# ---------------- PROMPT ----------------
 TRYON_OUTFIT_PROMPT = """
 ЗАДАЧА: ФОТО-РЕДАКТИРОВАНИЕ (НЕ генерация новой сцены).
-Нужно отредактировать базовое фото человека (ПОСЛЕДНИЙ Image), изменив ТОЛЬКО его одежду.
+Нужно отредактировать базовое фото человека (PERSON_BASE), изменив ТОЛЬКО его одежду.
 
 ПОРЯДОК ИЗОБРАЖЕНИЙ (КРИТИЧНО):
-- Image 1: PRINT_CROP (крупный план принта на футболке/верху) — ЭТАЛОН ПРИНТА. Должен совпасть 1:1.
-- Image 2: TOP_FULL (полное фото верха) — цвет/крой/посадка верха.
-- Image 3: BOTTOM (низ)
-- Image 4: SHOES (если есть)
-- Image 5: OUTER (если есть)
-- Последний Image: PERSON_BASE (человек) — БАЗОВОЕ ФОТО, его нельзя менять кроме одежды.
+- PRINT_CROP: крупный план принта — ЭТАЛОН ПРИНТА. Должен совпасть 1:1.
+- TOP_FULL: полное фото верха — цвет/крой/посадка верха.
+- BOTTOM: низ
+- SHOES: (если есть)
+- OUTER: (если есть)
+- PERSON_BASE: человек — БАЗОВОЕ ФОТО, его нельзя менять кроме одежды.
 
 РАЗРЕШЕНО МЕНЯТЬ ТОЛЬКО:
 - верх/низ/обувь/верхнюю одежду на человеке.
 
 ЗАПРЕЩЕНО (СТРОГО):
 - менять лицо/личность/пол/возраст/бороду/прическу
-- менять телосложение/рост/пропорции/позу/положение рук и ног
-- менять фон/помещение/мебель/свет/перспективу/ракурс
-- менять кадрирование/масштаб (не приближать, не переносить в другую комнату)
+- менять телосложение/рост/пропорции/позу
+- менять фон/свет/перспективу/ракурс
+- менять кадрирование/масштаб
 - добавлять других людей/предметы
 
 КРИТИЧНО ПРО ПРИНТ:
-- Принт на груди должен точно соответствовать Image 1 (PRINT_CROP): та же форма, контуры, цвета, расположение.
-- Не перерисовывай принт "по мотивам" и не подменяй текст/картинку.
+- Принт на груди должен ТОЧНО соответствовать PRINT_CROP: форма/контуры/цвета/расположение.
+- Не перерисовывай "по мотивам" и не подменяй текст/картинку.
 
 ЕСЛИ чего-то нет:
 - Если SHOES или OUTER не переданы — НЕ добавляй их.
@@ -350,11 +348,6 @@ TRYON_OUTFIT_PROMPT = """
 """.strip()
 
 
-def _auth_headers() -> Dict[str, str]:
-    # По докам GPTunnel: Authorization: KEY (без Bearer)
-    return {"Authorization": GPTUNNEL_KEY, "Content-Type": "application/json"}
-
-
 def _open_image(image_bytes: bytes) -> Image.Image:
     try:
         img = Image.open(BytesIO(image_bytes))
@@ -362,7 +355,6 @@ def _open_image(image_bytes: bytes) -> Image.Image:
         hint = " (HEIC? install pillow-heif)" if pillow_heif is None else ""
         raise HTTPException(400, f"Cannot decode image{hint}: {e}")
 
-    # EXIF orientation fix
     try:
         from PIL import ImageOps
         img = ImageOps.exif_transpose(img)
@@ -389,15 +381,7 @@ def _encode_jpeg(img: Image.Image, quality: int) -> bytes:
     return out.getvalue()
 
 
-def _to_data_url_jpeg(jpeg_bytes: bytes) -> str:
-    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
-
-
 def _make_center_crop(img: Image.Image, crop_w: float = 0.55, crop_h: float = 0.55) -> Image.Image:
-    """
-    Простой кроп по центру (для каталожных футболок на белом фоне это обычно попадает в принт).
-    """
     w, h = img.size
     cw = int(w * crop_w)
     ch = int(h * crop_h)
@@ -406,98 +390,75 @@ def _make_center_crop(img: Image.Image, crop_w: float = 0.55, crop_h: float = 0.
     return img.crop((left, top, left + cw, top + ch))
 
 
-def _pick_ar_from_size(w: int, h: int) -> str:
-    r = w / float(h)
-    # близко к квадрату
-    if 0.9 <= r <= 1.1:
-        return "1:1"
-    # портрет
-    if r < 1.0:
-        # 3:4 = 0.75, 9:16 = 0.5625
-        return "9:16" if r < 0.67 else "3:4"
-    # ландшафт
-    # 4:3 = 1.333, 16:9 = 1.777
-    return "16:9" if r > 1.55 else "4:3"
+def _img_part(jpeg_bytes: bytes) -> Dict[str, Any]:
+    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+    return {"inlineData": {"mimeType": "image/jpeg", "data": b64}}
 
 
-def _decode_data_url_image(url: str) -> Optional[bytes]:
-    url = (url or "").strip()
-    if not url.startswith("data:"):
-        return None
+def _make_client(timeout: httpx.Timeout) -> httpx.AsyncClient:
+    """
+    Создаём httpx клиент с прокси (если задан).
+    На новых версиях httpx используется proxy=..., на старых — proxies=...
+    """
+    if not PROXY_URL:
+        return httpx.AsyncClient(timeout=timeout, trust_env=False)
+
     try:
-        b64_part = url.split(",", 1)[1]
-        return base64.b64decode(b64_part)
-    except Exception:
-        return None
+        # httpx >= 0.27
+        return httpx.AsyncClient(timeout=timeout, trust_env=False, proxy=PROXY_URL)
+    except TypeError:
+        # старые версии
+        return httpx.AsyncClient(timeout=timeout, trust_env=False, proxies={"http": PROXY_URL, "https": PROXY_URL})
 
 
-async def _fetch_image_bytes(url: str, client: httpx.AsyncClient) -> bytes:
-    maybe = _decode_data_url_image(url)
-    if maybe:
-        return maybe
-    r = await client.get(url)
-    if r.status_code < 200 or r.status_code >= 300:
-        raise HTTPException(502, f"cannot fetch result image {r.status_code}: {(r.text or '')[:300]}")
-    return r.content
+async def _gemini_generate_image(
+    *,
+    model: str,
+    prompt: str,
+    labeled_images: List[Tuple[str, bytes]],
+) -> Tuple[bytes, str]:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
 
+    parts: List[Dict[str, Any]] = [{"text": prompt}]
+    for label, jpeg in labeled_images:
+        parts.append({"text": f"{label}:"})
+        parts.append(_img_part(jpeg))
 
-async def _media_create(payload: Dict[str, Any], client: httpx.AsyncClient) -> Dict[str, Any]:
-    r = await client.post(GPTUNNEL_CREATE_URL, headers=_auth_headers(), json=payload)
-    if r.status_code < 200 or r.status_code >= 300:
-        raise HTTPException(502, f"gptunnel create {r.status_code}: {(r.text or '')[:1200]}")
-    data = r.json()
-    if not isinstance(data, dict) or not data.get("id"):
-        raise HTTPException(502, f"unexpected create response: {str(data)[:1200]}")
-    return data
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"]
+        },
+    }
 
+    timeout = httpx.Timeout(connect=30.0, read=300.0, write=60.0, pool=60.0)
+    async with _make_client(timeout) as client:
+        r = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+        if r.status_code < 200 or r.status_code >= 300:
+            raise HTTPException(502, f"gemini {r.status_code}: {(r.text or '')[:1500]}")
+        data = r.json()
 
-async def _media_result(task_id: str, client: httpx.AsyncClient) -> Dict[str, Any]:
-    r = await client.post(GPTUNNEL_RESULT_URL, headers=_auth_headers(), json={"task_id": task_id})
-    if r.status_code < 200 or r.status_code >= 300:
-        raise HTTPException(502, f"gptunnel result {r.status_code}: {(r.text or '')[:1200]}")
-    data = r.json()
-    if not isinstance(data, dict) or not data.get("id"):
-        raise HTTPException(502, f"unexpected result response: {str(data)[:1200]}")
-    return data
+    # достаем картинку из ответа
+    for cand in (data.get("candidates") or []):
+        content = (cand or {}).get("content") or {}
+        for part in (content.get("parts") or []):
+            inline = (part or {}).get("inlineData")
+            if inline and isinstance(inline, dict) and inline.get("data"):
+                mime = inline.get("mimeType") or "image/png"
+                return base64.b64decode(inline["data"]), mime
 
-
-async def _wait_for_done(task_id: str, timeout_sec: int, interval_sec: float, client: httpx.AsyncClient) -> Dict[str, Any]:
-    t0 = time.time()
-    last: Optional[Dict[str, Any]] = None
-
-    while True:
-        last = await _media_result(task_id, client)
-        status = str(last.get("status") or "").lower()
-
-        # Логи на сервер (полезно)
-        print("tryon poll:", {"id": task_id, "status": status})
-
-        if status == "done":
-            return last
-        if status in ("error", "failed"):
-            raise HTTPException(502, f"tryon failed status={status}: {str(last)[:1200]}")
-
-        if time.time() - t0 > timeout_sec:
-            raise HTTPException(504, f"tryon timeout after {timeout_sec}s: {last}")
-
-        await asyncio.sleep(interval_sec)
+    raise HTTPException(502, f"gemini returned no image: {str(data)[:2000]}")
 
 
 @app.post("/tryon/outfit")
 async def tryon_outfit(
-    # вещи
     top: UploadFile = File(...),
     bottom: UploadFile = File(...),
     shoes: Optional[UploadFile] = File(None),
     outer: Optional[UploadFile] = File(None),
-    # человек (БАЗА)
     person_front: UploadFile = File(...),
-
     prompt_extra: Optional[str] = None,
-    model: Optional[str] = None,
-    ar: Optional[str] = Query(default=None, description="1:1|16:9|9:16|4:3|3:4"),
 ):
-    # -------- read inputs
     t_bytes = await top.read()
     b_bytes = await bottom.read()
     s_bytes = await shoes.read() if shoes else None
@@ -511,75 +472,45 @@ async def tryon_outfit(
     if not p_bytes:
         raise HTTPException(400, "person_front is empty")
 
-    # -------- decode images
     top_img = _open_image(t_bytes)
     bottom_img = _open_image(b_bytes)
     person_img = _open_image(p_bytes)
     shoes_img = _open_image(s_bytes) if (s_bytes and len(s_bytes) > 0) else None
     outer_img = _open_image(o_bytes) if (o_bytes and len(o_bytes) > 0) else None
 
-    # -------- ar
-    auto_ar = _pick_ar_from_size(*person_img.size)
-    use_ar = (ar or auto_ar).strip()
-    if use_ar not in ALLOWED_AR:
-        raise HTTPException(400, f"ar must be one of {ALLOWED_AR}, got {use_ar}")
-
-    # -------- encode with DIFFERENT quality
-    # PRINT_CROP: максимум качества
+    # JPEG подготовка (как у тебя)
     print_crop = _make_center_crop(top_img, crop_w=0.55, crop_h=0.55)
     print_crop = _resize_max(print_crop, 1200)
     print_crop_jpeg = _encode_jpeg(print_crop, quality=92)
 
-    # TOP_FULL: высокое качество
     top_full = _resize_max(top_img, 1600)
     top_full_jpeg = _encode_jpeg(top_full, quality=90)
 
-    # остальное можно пожать сильнее
     bottom_jpeg = _encode_jpeg(_resize_max(bottom_img, 1100), quality=82)
     person_jpeg = _encode_jpeg(_resize_max(person_img, 1300), quality=84)
 
-    images: List[str] = []
-    images.append(_to_data_url_jpeg(print_crop_jpeg))   # Image 1 PRINT_CROP (эталон принта)
-    images.append(_to_data_url_jpeg(top_full_jpeg))     # Image 2 TOP_FULL
-    images.append(_to_data_url_jpeg(bottom_jpeg))       # Image 3 BOTTOM
-
+    labeled: List[Tuple[str, bytes]] = [
+        ("PRINT_CROP", print_crop_jpeg),
+        ("TOP_FULL", top_full_jpeg),
+        ("BOTTOM", bottom_jpeg),
+    ]
     if shoes_img is not None:
         shoes_jpeg = _encode_jpeg(_resize_max(shoes_img, 1000), quality=80)
-        images.append(_to_data_url_jpeg(shoes_jpeg))    # Image 4 SHOES
+        labeled.append(("SHOES", shoes_jpeg))
     if outer_img is not None:
         outer_jpeg = _encode_jpeg(_resize_max(outer_img, 1200), quality=82)
-        images.append(_to_data_url_jpeg(outer_jpeg))    # Image 5 OUTER
+        labeled.append(("OUTER", outer_jpeg))
 
-    # КЛЮЧЕВО: человек всегда последним
-    images.append(_to_data_url_jpeg(person_jpeg))       # LAST = PERSON_BASE
+    labeled.append(("PERSON_BASE", person_jpeg))  # человек всегда последним
 
-    # -------- prompt
     prompt = TRYON_OUTFIT_PROMPT
     if prompt_extra and prompt_extra.strip():
         prompt += "\n\nДоп. требования:\n" + prompt_extra.strip()
 
-    use_model = (model or TRYON_MODEL_DEFAULT).strip()
+    out_bytes, mime = await _gemini_generate_image(
+        model=GEMINI_MODEL,
+        prompt=prompt,
+        labeled_images=labeled,
+    )
 
-    payload: Dict[str, Any] = {
-        "model": use_model,
-        "prompt": prompt,
-        "images": images,
-        "ar": use_ar,
-    }
-
-    # -------- call gptunnel
-    timeout = httpx.Timeout(connect=30.0, read=180.0, write=60.0, pool=60.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        created = await _media_create(payload, client)
-        task_id = created["id"]
-
-        done = await _wait_for_done(task_id, TRYON_POLL_TIMEOUT_SEC, TRYON_POLL_INTERVAL_SEC, client)
-
-        url = done.get("url")
-        if not url:
-            raise HTTPException(502, f"tryon done but url is null: {done}")
-
-        out_bytes = await _fetch_image_bytes(str(url), client)
-
-    # обычно webp/png — но клиенту ок отдавать как image/png, браузер откроет
-    return Response(content=out_bytes, media_type="image/png")
+    return Response(content=out_bytes, media_type=mime)
