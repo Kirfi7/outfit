@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Tuple
 import httpx
 from fastapi import HTTPException
 
-from app.core.config import get_settings
-from app.core.http import make_httpx_client
+from ..core.config import get_settings
+from ..core.http import make_httpx_client
 
 
 def img_part(jpeg_bytes: bytes) -> Dict[str, Any]:

@@ -1,10 +1,10 @@
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
-from app.core.prompts import CLOTHES_PROMPT, SHOES_PROMPT
-from app.schemas.sizes import ClothesOut, ShoesOut
-from app.services.aitunnel import aitunnel_chat
-from app.services.image_utils import encode_jpeg, open_image, resize_max, to_data_url_jpeg
-from app.services.parsing import safe_int
+from ...core.prompts import CLOTHES_PROMPT, SHOES_PROMPT
+from ...schemas.sizes import ClothesOut, ShoesOut
+from ...services.aitunnel import aitunnel_chat
+from ...services.image_utils import encode_jpeg, open_image, resize_max, to_data_url_jpeg
+from ...services.parsing import safe_int
 
 router = APIRouter()
 
