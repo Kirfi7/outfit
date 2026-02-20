@@ -3,8 +3,12 @@ from typing import Any, Dict
 import httpx
 from fastapi import HTTPException
 
-from ..core.config import get_settings
-from ..services.parsing import extract_json
+try:
+    from ..core.config import get_settings
+    from ..services.parsing import extract_json
+except ImportError:
+    from core.config import get_settings
+    from services.parsing import extract_json
 
 
 async def aitunnel_chat(messages: Any) -> Dict[str, Any]:
