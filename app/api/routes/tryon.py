@@ -3,9 +3,9 @@ from typing import Optional
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import Response
 
-from ...core.prompts import TRYON_OUTFIT_PROMPT
-from ...services.gemini import gemini_generate_image
-from ...services.image_utils import encode_jpeg, make_center_crop, open_image, resize_max
+from app.core.prompts import TRYON_OUTFIT_PROMPT
+from app.services.gemini import gemini_generate_image
+from app.services.image_utils import encode_jpeg, make_center_crop, open_image, resize_max
 
 router = APIRouter()
 
