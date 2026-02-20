@@ -3,7 +3,10 @@
 .mypy_cache
 .vscode
 pycache
+__pycache__/
 .pytest_cache
+.DS_Store
+.venv/
 parser_products/funko
 .env
 app/zphoto
