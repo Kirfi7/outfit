@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 
-from app.api.routes import health_router, sizes_router, tryon_router
-from app.core.config import get_settings
+from api.routes import health_router, sizes_router, tryon_router
+from core.config import get_settings
 
 
 def create_app() -> FastAPI:
