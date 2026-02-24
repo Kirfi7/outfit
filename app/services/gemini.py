@@ -19,6 +19,12 @@ def img_part(jpeg_bytes: bytes) -> Dict[str, Any]:
 
 async def gemini_generate_image(prompt: str, labeled_images: List[Tuple[str, bytes]]) -> Tuple[bytes, str]:
     settings = get_settings()
+
+    if not settings.gemini_api_key:
+        raise HTTPException(500, "GEMINI_API_KEY is not set")
+    if not settings.gemini_model:
+        raise HTTPException(500, "GEMINI_MODEL is not set")
+
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
@@ -29,9 +35,14 @@ async def gemini_generate_image(prompt: str, labeled_images: List[Tuple[str, byt
         parts.append({"text": f"{label}:"})
         parts.append(img_part(jpeg))
 
-    payload = {
+    payload: Dict[str, Any] = {
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"imageConfig": {"aspectRatio": settings.image_ar, "imageSize": settings.image_size}},
+        "generationConfig": {
+            "imageConfig": {
+                "aspectRatio": settings.image_ar,
+                "imageSize": settings.image_size,
+            }
+        },
     }
 
     timeout = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=60.0)
@@ -43,6 +54,7 @@ async def gemini_generate_image(prompt: str, labeled_images: List[Tuple[str, byt
 
     data = r.json()
 
+    # вытащим inlineData image
     for cand in (data.get("candidates") or []):
         content = (cand or {}).get("content") or {}
         for part in (content.get("parts") or []):
