@@ -30,6 +30,19 @@ async def tryon_outfit(
     o_bytes = await outer.read() if outer else None
     p_bytes = await person_front.read()
 
+    # --- DEBUG: что реально пришло в tryon ---
+    print("TRYON FILES bytes:",
+          "top", len(t_bytes),
+          "bottom", len(b_bytes),
+          "shoes", (len(s_bytes) if s_bytes else None),
+          "outer", (len(o_bytes) if o_bytes else None),
+          "person_front", len(p_bytes),
+          )
+
+    # Если клиент передал поле shoes, но оно пустое — НЕ продолжаем (иначе модель оставит базовую обувь)
+    if shoes is not None and (s_bytes is None or len(s_bytes) == 0):
+        raise HTTPException(400, "shoes was provided but empty (client bug: file not attached or read twice)")
+
     if not t_bytes:
         raise HTTPException(400, "top is empty")
     if not b_bytes:
