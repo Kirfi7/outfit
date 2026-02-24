@@ -18,8 +18,8 @@ class Settings(BaseSettings):
     aitunnel_key: str = Field(default="", alias="AITUNNEL_KEY")
 
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
-    # gemini_model: str = Field(default="gemini-2.5-flash-image", alias="GEMINI_MODEL")
-    gemini_model: str = Field(default="gemini-3-pro-image-preview", alias="GEMINI_MODEL")
+    gemini_model: str = Field(default="gemini-2.5-flash-image", alias="GEMINI_MODEL")
+    # gemini_model: str = Field(default="gemini-3-pro-image-preview", alias="GEMINI_MODEL")
     image_ar: str = Field(default="9:16", alias="IMAGE_AR")
     image_size: str = Field(default="1K", alias="IMAGE_SIZE")
     proxy_url: str = Field(default="http://sve2Zh:1W4P9D@138.219.173.226:8000", alias="PROXY_URL")
