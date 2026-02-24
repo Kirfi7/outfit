@@ -33,80 +33,80 @@ SHOES_PROMPT = """
 
 # ---- PASS 1: собираем базовый лук БЕЗ outer ----
 TRYON_BASE_PASS_PROMPT = """
-ЗАДАЧА: ФОТО-РЕДАКТИРОВАНИЕ (НЕ генерация новой сцены).
-Отредактируй PERSON_BASE, изменив ТОЛЬКО одежду: TOP_FULL + принт PRINT_CROP + BOTTOM (+ SHOES если есть).
-Итог должен выглядеть как то же фото, тот же человек, тот же фон.
+TASK: PHOTO EDITING (NOT generating a new scene).
+Edit PERSON_BASE by changing ONLY the clothing: TOP_FULL + PRINT_CROP print + BOTTOM (+ SHOES if provided).
+The result must look like the same photo: same person, same background.
 
-ЖЁСТКИЕ ПРАВИЛА:
-- PERSON_BASE — единственная база. Нельзя менять лицо, личность, возраст, пол, телосложение, позу, фон, свет, ракурс, кадрирование.
-- Разрешено менять ТОЛЬКО одежду на человеке (верх/низ/обувь).
-- В ЭТОМ ПРОХОДЕ НЕЛЬЗЯ добавлять/менять верхнюю одежду (OUTER). Даже если она есть — игнорируй её.
+STRICT RULES:
+- PERSON_BASE is the only base image. Do NOT change the face, identity, age, gender, body shape, pose, background, lighting, camera angle, or framing.
+- You may change ONLY the clothing on the person (top/bottom/shoes).
+- IN THIS PASS you must NOT add/change outerwear (OUTER). Even if it is provided — ignore it.
 
-ВХОДЫ (по тегам):
-PRINT_CROP = эталон принта на груди (1:1).
-TOP_FULL   = каталожное фото верха (футболка/поло), цвет/крой/материал.
-BOTTOM     = низ (брюки/джинсы), цвет/крой/материал.
-SHOES      = обувь (если есть).
-PERSON_BASE= человек (база).
+INPUTS (by tags):
+PRINT_CROP = the exact chest print reference (1:1).
+TOP_FULL   = catalog photo of the top (t-shirt/polo): color/cut/material.
+BOTTOM     = bottom (pants/jeans): color/cut/material.
+SHOES      = shoes (if provided).
+PERSON_BASE= the person (base).
 
-КРИТИЧНО ПРО ПРИНТ:
-- Принт на груди должен совпасть с PRINT_CROP ТОЧНО: контуры, цвета, текст, расположение.
-- НЕ перерисовывать "по мотивам" и НЕ подменять принт другим.
-- Если не получается перенести точно — лучше оставить исходный принт человека, но НЕ придумывать новый.
+PRINT IS CRITICAL:
+- The chest print must match PRINT_CROP EXACTLY: shapes/contours, colors, text, placement.
+- Do NOT redraw “inspired by” and do NOT replace the print with another.
+- If you cannot transfer the print exactly, it is better to keep the person’s original print, but do NOT invent a new one.
 
-ВЫХОД:
-Одно фотореалистичное изображение: тот же человек/фон, но в TOP_FULL+PRINT_CROP+BOTTOM(+SHOES).
+OUTPUT:
+One photorealistic image: same person/background, wearing TOP_FULL+PRINT_CROP+BOTTOM(+SHOES).
 """.strip()
 
-# ---- PASS 2: надеваем ТОЛЬКО outer поверх уже готового образа ----
+# ---- PASS 2: add ONLY outerwear on top of the already correct outfit ----
 TRYON_OUTER_PASS_PROMPT = """
-ЗАДАЧА: ФОТО-РЕДАКТИРОВАНИЕ (НЕ генерация новой сцены).
-Отредактируй PERSON_BASE, изменив ТОЛЬКО верхнюю одежду.
+TASK: PHOTO EDITING (NOT generating a new scene).
+Edit PERSON_BASE by changing ONLY the outerwear.
 
-ЖЁСТКИЕ ПРАВИЛА:
-- PERSON_BASE — единственная база. Нельзя менять лицо, личность, возраст, пол, телосложение, позу, фон, свет, ракурс, кадрирование.
-- Разрешено менять ТОЛЬКО верхнюю одежду (OUTER): надеть её поверх текущего образа.
-- НЕЛЬЗЯ менять верх (футболку/поло), принт, низ и обувь — они уже правильные.
+STRICT RULES:
+- PERSON_BASE is the only base image. Do NOT change the face, identity, age, gender, body shape, pose, background, lighting, camera angle, or framing.
+- You may change ONLY the outerwear (OUTER): put it on top of the current outfit.
+- You must NOT change the top (t-shirt/polo), the print, the bottom, or the shoes — they are already correct.
 
-ВХОДЫ (по тегам):
-OUTER      = верхняя одежда (куртка/пальто/плащ).
-PERSON_BASE= человек (уже в образе), это база.
+INPUTS (by tags):
+OUTER      = outerwear (jacket/coat/raincoat).
+PERSON_BASE= the person already wearing the outfit (base).
 
-ВЫХОД:
-Одно фотореалистичное изображение: тот же человек/фон, но с надетым OUTER поверх.
+OUTPUT:
+One photorealistic image: same person/background, now wearing OUTER on top.
 """.strip()
 
-# ---- (оставляю твой старый промт, можешь использовать для 1-pass если надо) ----
+# ---- (kept your old prompt: you can use it for one-pass if needed) ----
 TRYON_OUTFIT_PROMPT = """
-ЗАДАЧА: ФОТО-РЕДАКТИРОВАНИЕ (НЕ генерация новой сцены).
-Нужно отредактировать PERSON_BASE, изменив ТОЛЬКО одежду. Итог должен выглядеть как то же фото, тот же человек, тот же фон.
+TASK: PHOTO EDITING (NOT generating a new scene).
+Edit PERSON_BASE by changing ONLY the clothing. The result must look like the same photo: same person, same background.
 
-КЛЮЧЕВО (ЖЁСТКИЕ ПРАВИЛА):
-- PERSON_BASE — единственная база. Нельзя менять лицо, личность, возраст, пол, телосложение, позу, фон, свет, ракурс, кадрирование.
-- Разрешено менять ТОЛЬКО одежду на человеке.
-- Если передан OUTER — ОБЯЗАТЕЛЬНО надеть OUTER поверх TOP_FULL (верхняя одежда = приоритет №1).
-- Если передан SHOES — ОБЯЗАТЕЛЬНО заменить обувь на SHOES.
-- Если OUTER/SHOES не переданы — НЕ добавлять их “из головы”.
+KEY POINTS (STRICT RULES):
+- PERSON_BASE is the only base image. Do NOT change the face, identity, age, gender, body shape, pose, background, lighting, camera angle, or framing.
+- You may change ONLY the clothing on the person.
+- If OUTER is provided — you MUST put OUTER on top of TOP_FULL (outerwear has top priority).
+- If SHOES are provided — you MUST replace the shoes with SHOES.
+- If OUTER/SHOES are not provided — do NOT add them “from imagination”.
 
-ОПИСАНИЕ ВХОДОВ (по тегам, НЕ по порядку):
-PRINT_CROP = эталон принта на груди (1:1).
-TOP_FULL   = каталожное фото верха (футболка/поло), цвет/крой/материал.
-BOTTOM     = низ (брюки/джинсы), цвет/крой/материал.
-SHOES      = обувь (если есть).
-OUTER      = верхняя одежда (если есть).
-PERSON_BASE= человек (база).
+INPUT DESCRIPTION (by tags, NOT by order):
+PRINT_CROP = the exact chest print reference (1:1).
+TOP_FULL   = catalog photo of the top (t-shirt/polo): color/cut/material.
+BOTTOM     = bottom (pants/jeans): color/cut/material.
+SHOES      = shoes (if provided).
+OUTER      = outerwear (if provided).
+PERSON_BASE= the person (base).
 
-КРИТИЧНО ПРО ПРИНТ (САМОЕ ВАЖНОЕ):
-- Принт на груди должен совпасть с PRINT_CROP ТОЧНО, без “по мотивам”.
-- Копируй принт как есть: те же контуры, те же цвета, тот же текст, без замены слов/букв/символов.
-- Если принт невозможно перенести точно — лучше оставить исходный принт человека (но НЕ придумывать новый).
+PRINT IS CRITICAL (MOST IMPORTANT):
+- The chest print must match PRINT_CROP EXACTLY, not “inspired by”.
+- Copy the print as-is: same shapes, same colors, same text, no replacing words/letters/symbols.
+- If the print cannot be transferred exactly, it is better to keep the person’s original print, but do NOT invent a new one.
 
-ПРИОРИТЕТ СЛОЁВ ОДЕЖДЫ:
-1) OUTER (если есть) поверх всего
-2) TOP_FULL с принтом PRINT_CROP
+CLOTHING LAYER PRIORITY:
+1) OUTER (if provided) on top of everything
+2) TOP_FULL with PRINT_CROP
 3) BOTTOM
 4) SHOES
 
-ВЫХОД:
-Одно фотореалистичное изображение: тот же человек/фон, но в предоставленных вещах.
+OUTPUT:
+One photorealistic image: same person/background, wearing the provided items.
 """.strip()
